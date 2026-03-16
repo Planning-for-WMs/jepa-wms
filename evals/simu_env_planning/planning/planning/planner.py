@@ -450,6 +450,14 @@ class GRASPlanner(Planner):
         self.decode_unroll = decode_unroll
         # World model
         self.enc_pred_wm = enc_pred_wm
+        assert self.enc_pred_wm is not None, "GRASPlanner requires direct access to enc_pred_wm"
+        
+        # FREEZE WORLD MODEL PARAMETERS to prevent CUDA OOM during planning!
+        for param in self.enc_pred_wm.model.parameters():
+            param.requires_grad_(False)
+        self.enc_pred_wm.model.eval()
+
+        self.objective = None
         # Goal encoding (set via set_goal_enc before planning)
         self.goal_enc = None
 
@@ -470,14 +478,13 @@ class GRASPlanner(Planner):
             actions: (T, A) or (1, T, A) action tensor.
 
         Returns:
-            Clipped actions of the same shape.
         """
         if self.max_norms is not None:
             for dims, maxnorm in zip(self.max_norm_dims, self.max_norms):
                 actions[..., dims] = torch.clip(actions[..., dims], min=-maxnorm, max=maxnorm)
         return actions
 
-    def _one_step_predict(self, state_t: torch.Tensor, action_raw_t: torch.Tensor):
+    def _one_step_predict(self, state_t: torch.Tensor, action_raw_t: torch.Tensor, proprio_t: torch.Tensor = None):
         """Perform a single one-step prediction through the world model.
 
         Encodes the action, then calls forward_pred with ctxt_window=1 (single frame).
@@ -485,6 +492,7 @@ class GRASPlanner(Planner):
         Args:
             state_t: Virtual state at time t. Shape (B, 1, V, H, W, D).
             action_raw_t: Raw action at time t. Shape (B, 1, A).
+            proprio_t: Proprioceptive state at time t. Shape (B, 1, P).
 
         Returns:
             pred_vid: Predicted next visual state (B, 1, V, H, W, D).
@@ -497,16 +505,27 @@ class GRASPlanner(Planner):
         pred_vid, _, pred_prop = wm.forward_pred(
             state_t,
             act_feats,
-            None,  # No proprio in virtual state optimization
+            proprio_t,
         )
+        
+        if proprio_t is not None:
+            if getattr(self.enc_pred_wm, "proprio_mode", None) == "compute_new_pose":
+                from app.plan_common.datasets.droid_dset import compute_new_pose
+                pred_prop = compute_new_pose(proprio_t, action_raw_t)
+            elif getattr(self.enc_pred_wm, "proprio_mode", None) == "predict_proprio":
+                if pred_prop is not None:
+                    pred_prop = pred_prop[:, -1:]
         return pred_vid, pred_prop
 
     def _compute_grasp_loss(
         self,
         virtual_states: torch.Tensor,
+        virtual_proprios: torch.Tensor,
         actions: torch.Tensor,
         z_init_vid: torch.Tensor,
+        z_init_prop: torch.Tensor,
         goal_vid: torch.Tensor,
+        goal_prop: torch.Tensor,
         plan_length: int,
     ):
         """Compute the GRASP loss: grad-cut dynamics consistency + dense goal shaping.
@@ -518,52 +537,52 @@ class GRASPlanner(Planner):
 
         Args:
             virtual_states: (plan_length, 1, V, H, W, D) — z_1 to z_T.
+            virtual_proprios: Optional proprio tensor (plan_length, 1, P).
             actions: (1, plan_length, A) — a_0 to a_{T-1}.
             z_init_vid: (1, 1, V, H, W, D) — initial state z_0 (from encoder).
+            z_init_prop: Optional initial proprio z_0.
             goal_vid: (1, 1, V, H, W, D) — goal state g.
+            goal_prop: Optional goal proprio.
             plan_length: T, the planning horizon.
 
         Returns:
             total_loss: Scalar loss for gradient computation.
         """
-        # Build the full state sequence: z_0 (fixed), z_1, ..., z_T (optimized)
-        # z_0 is from the encoder, z_1..z_T are virtual states
-        # For the dynamics loss: F(z̄_t, a_t) should match z_{t+1}
-        #   t=0: F(z̄_0, a_0) → z_1
-        #   t=1: F(z̄_1, a_1) → z_2
-        #   ...
-        #   t=T-1: F(z̄_{T-1}, a_{T-1}) → (checked against goal for last step)
-
         dynamics_loss = 0.0
         goal_loss = 0.0
 
         for t in range(plan_length):
             # Get z_t (detached for stop-gradient)
             if t == 0:
-                z_t = z_init_vid.detach()  # z_0 is always fixed and detached
+                z_t = z_init_vid.detach()
+                p_t = z_init_prop.detach() if z_init_prop is not None else None
             else:
-                z_t = virtual_states[t - 1: t].detach()  # z̄_t: stop gradient
+                z_t = virtual_states[t - 1: t].detach()
+                p_t = virtual_proprios[t - 1: t].detach() if virtual_proprios is not None else None
 
             # Get target next state z_{t+1}
             if t < plan_length - 1:
-                z_next = virtual_states[t: t + 1]  # z_{t+1} (gets gradients!)
+                z_next = virtual_states[t: t + 1]
+                p_next = virtual_proprios[t: t + 1] if virtual_proprios is not None else None
             else:
-                z_next = None  # Last step: no dynamics target (or use goal)
+                z_next = None
+                p_next = None
 
             # One-step prediction: F(z̄_t, a_t)
-            # z_t shape: (1, 1, V, H, W, D), action: (1, 1, A)
             a_t = actions[:, t: t + 1, :]  # (1, 1, A)
-            pred_vid, _ = self._one_step_predict(z_t, a_t)
-            # pred_vid shape: (1, 1, V, H, W, D)
+            pred_vid, pred_prop = self._one_step_predict(z_t, a_t, p_t)
 
-            # Dynamics consistency loss (Eq. 8): ‖z_{t+1} − F(z̄_t, a_t)‖²
+            # Dynamics consistency loss (Eq. 8)
             if z_next is not None:
-                # z_next has shape (1, 1, V, H, W, D) — need to match pred_vid
                 dyn_diff = (z_next - pred_vid).pow(2).mean()
+                if p_next is not None and pred_prop is not None:
+                    dyn_diff = dyn_diff + (p_next - pred_prop).pow(2).mean()
                 dynamics_loss = dynamics_loss + dyn_diff
 
-            # Dense goal shaping (Eq. 9): ‖F(z̄_t, a_t) − g‖²
+            # Dense goal shaping (Eq. 9)
             goal_diff = (pred_vid - goal_vid).pow(2).mean()
+            if goal_prop is not None and pred_prop is not None:
+                goal_diff = goal_diff + (pred_prop - goal_prop).pow(2).mean()
             goal_loss = goal_loss + goal_diff
 
         total_loss = dynamics_loss + self.gamma * goal_loss
@@ -634,19 +653,27 @@ class GRASPlanner(Planner):
         else:
             plan_length = self.horizon
 
-        # Extract visual features from z_init
+        # Extract visual & proprio features from z_init
+        z_init_prop = None
+        has_proprio = False
         if isinstance(z_init, dict) or hasattr(z_init, 'keys'):
             z_init_vid = z_init["visual"]  # (1, tau, V, H, W, D)
+            if "proprio" in z_init and z_init["proprio"] is not None:
+                has_proprio = True
+                z_init_prop = z_init["proprio"][:, -1:, ...]
         else:
             z_init_vid = z_init  # (1, tau, V, H, W, D)
 
         # Use only the last frame as the initial state for planning
         z_init_vid_last = z_init_vid[:, -1:, ...]  # (1, 1, V, H, W, D)
 
-        # Extract goal visual encoding
+        # Extract goal visual & proprio encoding
         assert self.goal_enc is not None, "Goal encoding must be set via set_goal_enc() before planning."
+        goal_prop = None
         if isinstance(self.goal_enc, dict) or hasattr(self.goal_enc, 'keys'):
             goal_vid = self.goal_enc["visual"]  # (1, tau, V, H, W, D)
+            if "proprio" in self.goal_enc and self.goal_enc["proprio"] is not None:
+                goal_prop = self.goal_enc["proprio"][:, -1:, ...]
         else:
             goal_vid = self.goal_enc
         goal_vid = goal_vid[:, -1:, ...]  # (1, 1, V, H, W, D)
@@ -663,6 +690,7 @@ class GRASPlanner(Planner):
         actions = actions.detach().requires_grad_(True)
 
         # --- Initialize virtual states z_1, ..., z_T ---
+        virtual_proprios = None
         if self.state_init == "rollout" and plan_length > 0:
             # Initialize by doing a serial rollout with initial actions
             with torch.no_grad():
@@ -670,6 +698,10 @@ class GRASPlanner(Planner):
                 init_rollout = self.unroll(z_init, act_suffix=init_acts_for_unroll)
                 if isinstance(init_rollout, dict) or hasattr(init_rollout, 'keys'):
                     init_vid = init_rollout["visual"]  # (T+tau, 1, V, H, W, D)
+                    if has_proprio and "proprio" in init_rollout:
+                        tau_p = z_init_prop.shape[1] if has_proprio else 0
+                        virtual_proprios = init_rollout["proprio"][tau_p:, ...].clone()
+                        virtual_proprios = virtual_proprios.detach().requires_grad_(True)
                 else:
                     init_vid = init_rollout
                 # Take the predicted states (skip context frames)
@@ -677,8 +709,14 @@ class GRASPlanner(Planner):
                 virtual_states = init_vid[tau:, ...].clone()  # (T, 1, V, H, W, D)
         elif self.state_init == "zero":
             virtual_states = torch.zeros(plan_length, 1, V, H, W, D, device=self.device)
+            if has_proprio:
+                virtual_proprios = torch.zeros(plan_length, *z_init_prop.shape[1:], device=self.device)
+                virtual_proprios = virtual_proprios.detach().requires_grad_(True)
         else:  # "randn"
             virtual_states = torch.randn(plan_length, 1, V, H, W, D, device=self.device) * self.var_scale
+            if has_proprio:
+                virtual_proprios = torch.randn(plan_length, *z_init_prop.shape[1:], device=self.device) * self.var_scale
+                virtual_proprios = virtual_proprios.detach().requires_grad_(True)
         virtual_states = virtual_states.detach().requires_grad_(True)
 
         # --- Tracking ---
@@ -695,10 +733,13 @@ class GRASPlanner(Planner):
                 actions.grad.zero_()
             if virtual_states.grad is not None:
                 virtual_states.grad.zero_()
+            if virtual_proprios is not None and virtual_proprios.grad is not None:
+                virtual_proprios.grad.zero_()
 
             # Compute GRASP loss (grad-cut dynamics + dense goal shaping)
             total_loss = self._compute_grasp_loss(
-                virtual_states, actions, z_init_vid_last, goal_vid, plan_length,
+                virtual_states, virtual_proprios, actions,
+                z_init_vid_last, z_init_prop, goal_vid, goal_prop, plan_length,
             )
             total_loss.backward()
             losses.append(total_loss.item())
@@ -712,16 +753,22 @@ class GRASPlanner(Planner):
             with torch.no_grad():
                 if virtual_states.grad is not None:
                     virtual_states.data -= self.state_lr * virtual_states.grad
+                if virtual_proprios is not None and virtual_proprios.grad is not None:
+                    virtual_proprios.data -= self.state_lr * virtual_proprios.grad
+                    
                 # Langevin noise injection (Eq. 5)
                 if self.state_noise_std > 0:
-                    noise = torch.randn_like(virtual_states) * self.state_noise_std
-                    virtual_states.data += noise
+                    virtual_states.data += torch.randn_like(virtual_states) * self.state_noise_std
+                    if virtual_proprios is not None:
+                        virtual_proprios.data += torch.randn_like(virtual_proprios) * self.state_noise_std
 
             # Zero gradients after update
             if actions.grad is not None:
                 actions.grad.zero_()
             if virtual_states.grad is not None:
                 virtual_states.grad.zero_()
+            if virtual_proprios is not None and virtual_proprios.grad is not None:
+                virtual_proprios.grad.zero_()
 
             # --- Full-rollout synchronization (Section 3.4) ---
             if self.sync_every > 0 and (itr + 1) % self.sync_every == 0:
