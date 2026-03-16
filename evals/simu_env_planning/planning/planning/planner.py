@@ -343,6 +343,7 @@ class CEMPlanner(Planner):
         )
         return result
 
+
 class GRASPlanner(Planner):
     """GRASP: Gradient RelAxed Stochastic Planner.
 
@@ -794,6 +795,235 @@ class GRASPlanner(Planner):
             losses=losses_tensor,
             prev_elite_losses_mean=losses_tensor,  # No elites in GRASP; use raw losses
             prev_elite_losses_std=torch.zeros_like(losses_tensor),
+            pred_frames_over_iterations=pred_frames_over_iterations if self.decode_each_iteration else None,
+            predicted_best_encs_over_iterations=predicted_best_encs_over_iterations,
+        )
+        return result
+
+
+class CEMGDPlanner(Planner):
+    """CEM-GD Planner: Cross-Entropy Method with Gradient Descent refinement.
+
+    Combines CEM sampling with gradient-based optimization:
+    1. Sample N action sequences from a Gaussian, iterate CEM to refine the distribution.
+    2. Select top-k elite sequences from the final CEM distribution.
+    3. Refine each elite with G gradient descent steps, trying J geometrically-decaying
+       step sizes (eta_init * rho^j for j=0..J-1) and keeping the best.
+    4. Pick the overall best refined sequence and execute the first action(s).
+    """
+
+    def __init__(
+        self,
+        unroll: Callable,
+        action_dim: int,
+        horizon: int = 32,
+        # CEM parameters
+        num_samples: int = 512,
+        var_scale: float = 1.0,
+        num_elites: int = 64,
+        iterations: int = 6,
+        momentum_mean: float = 0.0,
+        momentum_std: float = 0.0,
+        # GD refinement parameters
+        top_k: int = 1,
+        gd_steps: int = 10,
+        gd_lr_init: float = 0.01,
+        gd_lr_decay: float = 0.67,
+        gd_num_lrs: int = 8,
+        # Action clipping
+        max_norms: List[float] = None,
+        max_norm_dims: List[List[int]] = [[0, 1, 2], [6]],
+        # Output
+        num_act_stepped: int = None,
+        decode_each_iteration: bool = False,
+        decode_unroll: Callable = None,
+        # Distribution
+        distribute_planner: bool = False,
+        local_generator: torch.Generator = None,
+        **kwargs,
+    ):
+        super().__init__(unroll)
+        self.action_dim = action_dim
+        self.horizon = horizon
+        self.device = torch.device("cuda")
+        # CEM
+        self.num_samples = num_samples
+        self.var_scale = var_scale
+        self.num_elites = num_elites
+        self.iterations = iterations
+        self.momentum_mean = momentum_mean
+        self.momentum_std = momentum_std
+        # GD refinement
+        self.top_k = top_k
+        self.gd_steps = gd_steps
+        self.gd_lr_init = gd_lr_init
+        self.gd_lr_decay = gd_lr_decay
+        self.gd_num_lrs = gd_num_lrs
+        # Clipping
+        self.max_norms = max_norms
+        self.max_norm_dims = max_norm_dims
+        # Output
+        self.num_act_stepped = num_act_stepped
+        self.decode_each_iteration = decode_each_iteration
+        self.decode_unroll = decode_unroll
+        # Distribution
+        self.distribute_planner = distribute_planner
+        self.local_generator = local_generator
+
+    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Apply per-dimension-group clipping to actions."""
+        if self.max_norms is not None:
+            for dims, maxnorm in zip(self.max_norm_dims, self.max_norms):
+                actions[..., dims] = torch.clip(actions[..., dims], min=-maxnorm, max=maxnorm)
+        return actions
+
+    def _gd_refine(self, actions_init: torch.Tensor, z_init: torch.Tensor) -> torch.Tensor:
+        """Refine a single action sequence using gradient descent with multiple step sizes.
+
+        Tries J different step sizes (gd_lr_init * gd_lr_decay^j for j=0..J-1), runs G
+        gradient steps with each, and returns the action sequence with the lowest final cost.
+
+        Args:
+            actions_init: (plan_length, action_dim) single action sequence to refine.
+            z_init: Initial latent state for rollout.
+
+        Returns:
+            best_actions: (plan_length, action_dim) refined action sequence.
+        """
+        best_cost = float("inf")
+        best_actions = actions_init.clone()
+
+        for j in range(self.gd_num_lrs):
+            lr = self.gd_lr_init * (self.gd_lr_decay ** j)
+
+            # Clone the initial actions for this step-size trial: (1, T, A)
+            actions = actions_init.clone().unsqueeze(0).detach().requires_grad_(True)
+
+            for _ in range(self.gd_steps):
+                if actions.grad is not None:
+                    actions.grad.zero_()
+
+                # Rollout: unroll expects (T, B, A)
+                actions_for_unroll = actions.squeeze(0).unsqueeze(1)  # (T, 1, A)
+                predicted_encs = self.unroll(z_init, act_suffix=actions_for_unroll)
+                loss = self.objective(predicted_encs, actions_for_unroll)
+                total_loss = loss.mean()
+                total_loss.backward()
+
+                with torch.no_grad():
+                    actions.data -= lr * actions.grad
+                    actions.data = self._clip_actions(actions.data)
+
+                actions.grad.zero_()
+
+            # Evaluate final cost for this step size
+            with torch.no_grad():
+                actions_for_unroll = actions.squeeze(0).unsqueeze(1)  # (T, 1, A)
+                final_cost = self.cost_function(actions_for_unroll, z_init).item()
+
+            if final_cost < best_cost:
+                best_cost = final_cost
+                best_actions = actions.squeeze(0).detach().clone()
+
+        return best_actions
+
+    def plan(
+        self,
+        z_init: torch.Tensor,
+        steps_left: int = None,
+    ) -> PlanningResult:
+        if steps_left is not None:
+            plan_length = min(self.horizon, steps_left)
+        else:
+            plan_length = self.horizon
+
+        # --- CEM Phase: sample and iterate to refine the distribution ---
+        mean = torch.zeros(plan_length, self.action_dim, device=self.device)
+        std = self.var_scale * torch.ones(plan_length, self.action_dim, device=self.device)
+        actions = torch.empty(
+            plan_length, self.num_samples, self.action_dim, device=self.device,
+        )
+        losses = []
+        elite_means, elite_stds = [], []
+        predicted_best_encs_over_iterations = []
+        pred_frames_over_iterations = [] if self.decode_each_iteration else None
+
+        with torch.no_grad():
+            for itr in range(self.iterations):
+                # Sample action sequences
+                actions[:, :] = mean.unsqueeze(1) + std.unsqueeze(1) * torch.randn(
+                    plan_length, self.num_samples, self.action_dim,
+                    device=self.device, generator=self.local_generator,
+                )
+                # Mean sample inclusion trick
+                actions[:, 0, :] = mean
+                # Clip
+                if self.max_norms is not None:
+                    for h in range(plan_length):
+                        for dims, maxnorm in zip(self.max_norm_dims, self.max_norms):
+                            actions[h, :, dims] = torch.clip(actions[h, :, dims], min=-maxnorm, max=maxnorm)
+                # Evaluate costs
+                cost = self.cost_function(actions, z_init).unsqueeze(1)  # (N, 1)
+                losses.append(cost.min().item())
+                # Gather if distributed
+                if self.distribute_planner:
+                    cost = torch.cat(FullGatherLayer.apply(cost), dim=0)
+                    all_actions = torch.cat(FullGatherLayer.apply(actions), dim=1)
+                else:
+                    all_actions = actions
+                # Select elites
+                elite_idxs = torch.topk(-cost.squeeze(1), self.num_elites, dim=0).indices
+                elite_loss, elite_actions = cost[elite_idxs], all_actions[:, elite_idxs]
+                elite_means.append(elite_loss.mean().item())
+                elite_stds.append(elite_loss.std().item())
+                # Update CEM distribution
+                new_mean = torch.mean(elite_actions, dim=1)
+                new_std = torch.std(elite_actions, dim=1)
+                mean = new_mean * (1 - self.momentum_mean) + mean * self.momentum_mean
+                std = new_std * (1 - self.momentum_std) + std * self.momentum_std
+
+            # --- Select top-k from final CEM iteration's elite set ---
+            # Use the last cost/actions already computed in the final CEM iteration
+            top_k_idxs = torch.topk(-cost.squeeze(1), self.top_k, dim=0).indices  # (k,)
+            top_k_actions = all_actions[:, top_k_idxs, :]  # (T, k, A)
+
+        # --- GD Refinement Phase ---
+        best_overall_cost = float("inf")
+        best_overall_actions = None
+
+        for i in range(self.top_k):
+            candidate = top_k_actions[:, i, :]  # (T, A)
+            refined = self._gd_refine(candidate, z_init)
+
+            with torch.no_grad():
+                refined_for_unroll = refined.unsqueeze(1)  # (T, 1, A)
+                refined_cost = self.cost_function(refined_for_unroll, z_init).item()
+
+            if refined_cost < best_overall_cost:
+                best_overall_cost = refined_cost
+                best_overall_actions = refined
+
+        losses.append(best_overall_cost)
+
+        # --- Final logging ---
+        with torch.no_grad():
+            final_for_unroll = best_overall_actions.unsqueeze(1)  # (T, 1, A)
+            predicted_best_encs = self.unroll(z_init, act_suffix=final_for_unroll)
+            predicted_best_encs_over_iterations.append(predicted_best_encs)
+            if self.decode_each_iteration and self.decode_unroll is not None:
+                pred_frames = self.decode_unroll(predicted_best_encs)
+                pred_frames_over_iterations.append(pred_frames)
+
+        a = best_overall_actions[: self.num_act_stepped] if self.num_act_stepped else best_overall_actions
+        if self.distribute_planner:
+            dist.broadcast(a, src=0)
+
+        losses_tensor = torch.tensor(losses).detach().unsqueeze(-1)
+        result = PlanningResult(
+            actions=a,
+            losses=losses_tensor,
+            prev_elite_losses_mean=torch.tensor(elite_means).unsqueeze(-1),
+            prev_elite_losses_std=torch.tensor(elite_stds).unsqueeze(-1),
             pred_frames_over_iterations=pred_frames_over_iterations if self.decode_each_iteration else None,
             predicted_best_encs_over_iterations=predicted_best_encs_over_iterations,
         )
