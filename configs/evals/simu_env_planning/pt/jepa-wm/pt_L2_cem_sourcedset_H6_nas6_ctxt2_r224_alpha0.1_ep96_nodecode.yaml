@@ -30,6 +30,8 @@ model_kwargs:
       batch_size: 8
     custom:
       frameskip: 5
+      action_skip: 1
+      state_skip: 1
   data_aug:
     normalize:
     - - 0.485
@@ -102,7 +104,7 @@ model_kwargs:
     ctxt_window: 2
 planner:
   planner_name: "grasp"
-  horizon: 40
+  horizon: 6
   steps: 100
   action_lr: 0.01
   state_lr: 0.01
@@ -112,7 +114,14 @@ planner:
   sync_steps: 5
   sync_lr: 0.01
   state_init: "rollout"
-  num_act_stepped: 1
+  num_act_stepped: 6
+  repeat_actskip: false
+  distribute_planner: false
+  decode_each_iteration: false
+  planning_objective:
+    objective_type: L2
+    sum_all_diffs: false
+    alpha: 0.1
 task_specification:
   task: pusht-base
   obs: rgb_state
