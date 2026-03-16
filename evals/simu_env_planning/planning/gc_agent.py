@@ -15,7 +15,6 @@ from evals.simu_env_planning.planning.planning.planner import (
     AdamPlanner,
     CEMPlanner,
     GradientDescentPlanner,
-    GRASPlanner,
     MPPIPlanner,
     NevergradPlanner,
 )
@@ -92,14 +91,6 @@ class GC_Agent:
                 decode_unroll=self.model.decode_unroll,
                 **self.cfg.planner,
             )
-        elif self.cfg.planner.planner_name == "grasp":
-            self.planner = GRASPlanner(
-                unroll=self.model.unroll,
-                action_dim=self.model.action_dim,
-                enc_pred_wm=self.model,
-                decode_unroll=self.model.decode_unroll,
-                **self.cfg.planner,
-            )
         else:
             raise ValueError(f"Unknown planner: {self.cfg.planner}")
 
@@ -130,9 +121,6 @@ class GC_Agent:
 
         if self.planner is not None:
             self.planner.set_objective(self.objective)
-            # GRASP planner also needs the goal encoding for dense goal shaping
-            if hasattr(self.planner, 'set_goal_enc'):
-                self.planner.set_goal_enc(self.goal_state_enc)
 
     def plan(
         self,
