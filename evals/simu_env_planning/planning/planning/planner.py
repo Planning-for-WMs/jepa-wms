@@ -12,6 +12,7 @@ import nevergrad as ng
 import numpy as np
 import torch
 import torch.distributed as dist
+from tensordict import TensorDict
 
 from evals.simu_env_planning.planning.planning import objectives
 from src.utils.logging import get_logger
@@ -347,159 +348,214 @@ class GRASPlanner():
     def __init__(
         self,
         unroll: Callable,
-        iterations: int = 6,
-        num_samples: int = 1,
+        action_dim: int,
         horizon: int = 32,
-        action_dim: int = 4,
-        var_scale: float = 1,
-        num_elites: int = 64,
-        momentum_mean: float = 0.0,
-        momentum_std: float = 0.0,
+        iterations: int = 100,
+        state_lr: float = 0.01,
+        action_lr: float = 0.01,
+        gamma: float = 1.0,
+        K_sync: int = 10,
+        J_sync: int = 1,
+        sync_lr: float = 0.01,
+        state_sigma: float = 0.01,
+        epsilon: float = 0.01,
+        var_scale: float = 1.0,
         max_norms: List[float] = None,
         max_norm_dims: List[List[int]] = [[0, 1, 2], [6]],
-        distribute_planner: bool = False,
-        local_generator: torch.Generator = None,
         num_act_stepped: int = None,
         decode_each_iteration: bool = False,
         decode_unroll: Callable = None,
-        state_num_patches: int = 196,
-        state_dim: int = 384,
-        steps: int = 100,
-        enc_pred_wm: nn.Module = None,
-        state_lr
+        enc_pred_wm: torch.nn.Module = None,
         **kwargs,
     ):
         super().__init__(unroll)
-        self.iterations = iterations
-        self.num_samples = num_samples
-        self.horizon = horizon
         self.action_dim = action_dim
-        self.device = torch.device("cuda")
+        self.horizon = horizon
+        self.iterations = iterations
+        self.state_lr = state_lr
+        self.action_lr = action_lr
+        self.gamma = gamma
+        self.K_sync = K_sync
+        self.J_sync = J_sync
+        self.sync_lr = sync_lr
+        self.state_sigma = state_sigma
+        self.epsilon = epsilon
         self.var_scale = var_scale
         self.num_elites = num_elites
         self.momentum_mean = momentum_mean
         self.momentum_std = momentum_std
         self.max_norms = max_norms
         self.max_norm_dims = max_norm_dims
-        self._prev_mean = None
-        self.distribute_planner = distribute_planner
-        self.local_generator = local_generator
         self.num_act_stepped = num_act_stepped
         self.decode_each_iteration = decode_each_iteration
         self.decode_unroll = decode_unroll
-        self.steps = steps
         self.enc_pred_wm = enc_pred_wm
+        self.device = torch.device("cuda")
 
-    def loss_func(self, states: torch.Tensor, actions: torch.Tensor, z_init: torch.Tensor) -> torch.Tensor:
-        pass
+    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Apply per-dimension clipping to actions if max_norms is set."""
+        if self.max_norms is not None:
+            for dims, maxnorm in zip(self.max_norm_dims, self.max_norms):
+                actions[:, :, dims] = actions[:, :, dims].clamp(-maxnorm, maxnorm)
+        return actions
 
-
-    @torch.no_grad()
     def plan(
         self,
         z_init,
         steps_left=None,
-    ):
+    ) -> PlanningResult:
         """
-        GRASP
+        GRASP: joint gradient-based optimization of actions and states
+        with periodic synchronization via world model rollout.
 
         Args:
-                z_init (torch.Tensor): Latent state from which to plan.
-                t0 (bool): Whether this is the first observation in the episode.
-                eval_mode (bool): Whether to use the mean of the action distribution.
-                task (Torch.Tensor): Task index (only used for multi-task experiments).
-
-        Returns:
-                torch.Tensor: Action to take in the environment.
+            z_init: Initial latent state [B, tau, V, H, W, D] or TensorDict
+            steps_left: Number of steps left in episode (optional)
         """
-        if steps_left is None:
-            plan_length = self.horizon
+        plan_length = min(self.horizon, steps_left) if steps_left is not None else self.horizon
+
+        # --- Extract goal from objective and determine shapes ---
+        z_goal = self.objective.target_enc  # set via set_objective
+        is_tensordict = isinstance(z_init, TensorDict)
+        if is_tensordict:
+            z_init_visual = z_init["visual"]  # [B, tau, V, H, W, D]
+            z_init_proprio = z_init["proprio"]  # [B, tau, N, D_prop] (encoded proprio)
+            z_goal_visual = z_goal["visual"]
         else:
-            plan_length = min(self.horizon, steps_left)
-        a_mean = torch.zeros(plan_length, self.action_dim, device=self.device)
-        a_std = self.var_scale * torch.ones(plan_length, self.action_dim, device=self.device)
-        s_mean = torch.zeros(plan_length-1, self.state_num_patches, self.state_dim, device=self.device)
-        s_std = self.var_scale * torch.ones(plan_length-1, self.state_num_patches, self.state_dim, device=self.device)
-        actions = torch.empty(
-            plan_length,
-            self.num_samples,
-            self.action_dim,
-            device=self.device,
-        )
-        states = torch.empty(
-            plan_length-1,
-            self.num_samples,
-            self.state_num_patches,
-            self.state_dim,
-            device=self.device,
-        )
-        losses, elite_means, elite_stds = [], [], []
+            z_init_visual = z_init
+            z_init_proprio = None
+            z_goal_visual = z_goal
+
+        B = z_init_visual.shape[0]
+        tau = z_init_visual.shape[1]
+        state_shape = z_init_visual.shape[2:]  # (V, H, W, D)
+
+        # s_0: last context frame, fixed throughout optimization
+        s_0 = z_init_visual[:, -1:, ...]  # [B, 1, V, H, W, D]
+        # Proprio for forward_pred: use last context frame's proprio as constant
+        proprio_const = z_init_proprio[:, -1:, ...] if z_init_proprio is not None else None  # [B, 1, N, D_prop]
+        # Goal for loss: last frame of goal encoding
+        z_goal_flat = z_goal_visual[:, -1:, ...]  # [B_goal, 1, V, H, W, D]
+
+        # --- Freeze predictor ---
+        self.enc_pred_wm.model.eval()
+        for p in self.enc_pred_wm.model.parameters():
+            p.requires_grad_(False)
+
+        # --- Initialize actions [T, B, A] as zeros ---
+        actions = torch.zeros(plan_length, B, self.action_dim, device=self.device)
+        actions = actions.detach().requires_grad_(True)
+
+        # --- Initialize states [T, B, *state_shape] as linear interpolation s_0 -> g + noise ---
+        # weights: t/(T) for t=1..T (states represent s_1..s_T)
+        weights = torch.linspace(1.0 / plan_length, 1.0, plan_length, device=self.device)
+        # Reshape for broadcasting: [T, 1, 1, 1, 1, 1] for [T, B, V, H, W, D]
+        w = weights.view(plan_length, *([1] * (len(state_shape) + 1)))
+        s_0_squeezed = s_0.squeeze(1)  # [B, V, H, W, D]
+        g_squeezed = z_goal_flat.squeeze(1)  # [B, V, H, W, D]
+        states_interp = (1 - w) * s_0_squeezed.unsqueeze(0) + w * g_squeezed.unsqueeze(0)  # [T, B, *state_shape]
+        states = (states_interp + self.epsilon * torch.randn_like(states_interp)).detach().requires_grad_(True)
+
+        losses = []
         predicted_best_encs_over_iterations = []
-        if self.decode_each_iteration:
-            pred_frames_over_iterations = []
+        pred_frames_over_iterations = [] if self.decode_each_iteration else None
 
-        actions[:, :] = a_mean.unsqueeze(1) + a_std.unsqueeze(1) * torch.randn(
-            plan_length, self.num_samples, self.action_dim, device=std.device, generator=self.local_generator
-        )
-        states[:, :] = s_mean.unsqueeze(1) + s_std.unsqueeze(1) * torch.randn(
-            plan_length-1, self.num_samples, self.state_num_patches, self.state_dim, device=std.device, generator=self.local_generator
-        )
-        # Mean sample inclusion trick to never loose best previous action
-        actions[:, 0, :] = a_mean
-        # Apply clipping if max_norms is specified
-        if self.max_norms is not None:
-            for h in range(plan_length):
-                # Loop through each group of dimensions to clip
-                for i, (dims, maxnorm) in enumerate(zip(self.max_norm_dims, self.max_norms)):
-                    # Clip the specified dimensions to [-maxnorm, maxnorm]
-                    actions[h, :, dims] = torch.clip(actions[h, :, dims], min=-maxnorm, max=maxnorm)
-                    states[h, :, dims] = torch.clip(states[h, :, dims], min=-maxnorm, max=maxnorm)
+        # --- Main GRASP optimization loop ---
+        for k in range(self.iterations):
+            # Full state trajectory: [B, T+1, V, H, W, D]
+            # full_states[:, 0] = s_0 (fixed), full_states[:, 1:] = states (optimizable)
+            states_B = states.permute(1, 0, *range(2, states.ndim))  # [B, T, V, H, W, D]
+            full_states = torch.cat([s_0, states_B], dim=1)  # [B, T+1, V, H, W, D]
 
-        
-        # Gradient Descent
-        for itr in range(self.steps):
-            self.enc_pred_wm.model.eval()
-            states = states - 2 * self.state_lr * (self.states - self.enc_pred_wm.model.forward_pred(states, actions, z_init))
-            # Compute elite actions
-            cost = self.cost_function(states, actions, z_init).unsqueeze(1)
-            losses.append(cost.min().item())
-            # Gather all values
-            if self.distribute_planner:
-                cost = torch.cat(FullGatherLayer.apply(cost), dim=0)
-                all_actions = torch.cat(FullGatherLayer.apply(actions), dim=1)
+            # Encode actions: [T, B, A] -> [B, T, A] -> encode
+            actions_BTA = actions.permute(1, 0, 2)  # [B, T, A]
+            act_feats = self.enc_pred_wm.model.encode_act(actions_BTA)
+
+            # --- Per-step losses (Eq. 8, 9, 10) ---
+            dyn_loss = torch.tensor(0.0, device=self.device)
+            predictions = []
+            for t in range(plan_length):
+                # F_theta(stop_grad(s_t), a_t) — stop-gradient on s_t
+                s_t = full_states[:, t : t + 1].detach()  # [B, 1, V, H, W, D]
+                a_t = act_feats[:, t : t + 1]
+                pred_next, _, _ = self.enc_pred_wm.model.forward_pred(s_t, a_t, proprio_const)
+                # pred_next: [B, 1, V, H, W, D]
+
+                # L_dyn (Eq. 8): ||F(sg(s_t), a_t) - s_{t+1}||^2
+                s_next = full_states[:, t + 1 : t + 2]
+                dyn_loss = dyn_loss + (pred_next - s_next).pow(2).mean()
+
+                predictions.append(pred_next)
+
+            # L_goal (Eq. 9): use self.objective on stacked predictions
+            # Stack predictions: [T, B, V, H, W, D] (matching objective's expected shape)
+            pred_stack = torch.cat(predictions, dim=1)  # [B, T, V, H, W, D]
+            pred_stack = pred_stack.permute(1, 0, *range(2, pred_stack.ndim))  # [T, B, V, H, W, D]
+            # Wrap in TensorDict if objective expects it (target_enc is TensorDict)
+            if is_tensordict:
+                # Expand proprio_const [B,1,N,D_p] to [T,B,N,D_p] for objective
+                proprio_expanded = proprio_const.permute(1, 0, *range(2, proprio_const.ndim)).expand(plan_length, -1, *proprio_const.shape[2:])
+                pred_for_obj = TensorDict({"visual": pred_stack, "proprio": proprio_expanded})
             else:
-                all_actions = actions
-            elite_idxs = torch.topk(-cost.squeeze(1), self.num_elites, dim=0).indices
-            elite_loss, elite_actions = cost[elite_idxs], all_actions[:, elite_idxs]  # [EL,1] , [H,EL,A]
-            # Log the mean and std of the elite values
-            elite_means.append(elite_loss.mean().item())
-            elite_stds.append(elite_loss.std().item())
-            # Update parameters with momentum
-            new_mean = torch.mean(elite_actions, dim=1)
-            new_std = torch.std(elite_actions, dim=1)
-            # Apply momentum to mean and std updates
-            mean = new_mean * (1 - self.momentum_mean) + mean * self.momentum_mean
-            std = new_std * (1 - self.momentum_std) + std * self.momentum_std
-            # Decoding logic
-            predicted_best_encs = self.unroll(z_init, act_suffix=mean.unsqueeze(1))
-            predicted_best_encs_over_iterations.append(predicted_best_encs)
-            if self.decode_each_iteration and self.decode_unroll is not None:
-                pred_frames = self.decode_unroll(
-                    predicted_best_encs,
-                )
-                pred_frames_over_iterations.append(pred_frames)
-                # [T H W 3]: uint 8 in [0, 255]
+                pred_for_obj = pred_stack
+            goal_loss = self.objective(pred_for_obj, actions_BTA, keepdims=False)
+            if goal_loss.ndim > 0:
+                goal_loss = goal_loss.mean()
 
-        self._prev_mean = mean
-        a = mean[: self.num_act_stepped]
-        if self.distribute_planner:
-            dist.broadcast(a, src=0)
+            # Total loss (Eq. 10)
+            total_loss = dyn_loss + self.gamma * goal_loss
+            losses.append(total_loss.item())
+
+            # --- Compute gradients via autograd (no stored .grad needed) ---
+            grad_actions, grad_states = torch.autograd.grad(total_loss, [actions, states])
+
+            # --- Update actions (Eq. 12) and states (Eq. 11) ---
+            actions = self._clip_actions(actions - self.action_lr * grad_actions).detach().requires_grad_(True)
+            states = (states - self.state_lr * grad_states + self.state_sigma * torch.randn_like(states)).detach().requires_grad_(True)
+
+            # --- Periodic sync step ---
+            if (k + 1) % self.K_sync == 0:
+                # Rollout from z_init to re-sync states
+                with torch.no_grad():
+                    sync_rollout = self.unroll(z_init, act_suffix=actions.detach())
+                    if is_tensordict:
+                        new_states = sync_rollout["visual"][tau:]  # [T, B, V, H, W, D]
+                    else:
+                        new_states = sync_rollout[tau:]
+                    states = new_states.detach().requires_grad_(True)
+
+                # J_sync GD steps on actions via goal loss through full rollout
+                for _ in range(self.J_sync):
+                    actions_for_sync = actions.detach().clone().requires_grad_(True)
+                    sync_rollout = self.unroll(z_init, act_suffix=actions_for_sync)
+                    if is_tensordict:
+                        final_state = sync_rollout["visual"][-1:]  # [1, B, V, H, W, D]
+                    else:
+                        final_state = sync_rollout[-1:]
+                    sync_goal_loss = (final_state - z_goal_flat).pow(2).mean()
+                    grad_sync = torch.autograd.grad(sync_goal_loss, actions_for_sync)[0]
+                    actions = self._clip_actions(actions - self.sync_lr * grad_sync).detach().requires_grad_(True)
+
+            # --- Optional: store predictions for visualization ---
+            if self.decode_each_iteration and self.decode_unroll is not None:
+                with torch.no_grad():
+                    pred_encs = self.unroll(z_init, act_suffix=actions.detach())
+                    predicted_best_encs_over_iterations.append(pred_encs)
+                    pred_frames_over_iterations.append(self.decode_unroll(pred_encs))
+
+        # --- Final unroll for returning predicted encodings ---
+        with torch.no_grad():
+            final_pred_encs = self.unroll(z_init, act_suffix=actions.detach())
+            predicted_best_encs_over_iterations.append(final_pred_encs)
+
+        # --- Return optimized actions ---
+        final_actions = actions.detach().squeeze(1)  # [T, A] when B=1
         result = PlanningResult(
-            actions=a,
+            actions=final_actions[: self.num_act_stepped] if self.num_act_stepped else final_actions,
             losses=torch.tensor(losses).detach().unsqueeze(-1),
-            prev_elite_losses_mean=torch.tensor(elite_means).unsqueeze(-1),
-            prev_elite_losses_std=torch.tensor(elite_stds).unsqueeze(-1),
-            pred_frames_over_iterations=pred_frames_over_iterations if self.decode_each_iteration else None,
+            prev_elite_losses_mean=torch.tensor(losses).detach().unsqueeze(-1),
+            prev_elite_losses_std=torch.zeros(len(losses)).unsqueeze(-1),
+            pred_frames_over_iterations=pred_frames_over_iterations,
             predicted_best_encs_over_iterations=predicted_best_encs_over_iterations,
         )
         return result

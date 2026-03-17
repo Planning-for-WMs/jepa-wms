@@ -91,6 +91,14 @@ class GC_Agent:
                 decode_unroll=self.model.decode_unroll,
                 **self.cfg.planner,
             )
+        elif self.cfg.planner.planner_name == "grasp":
+            self.planner = GRASPlanner(
+                unroll=self.model.unroll,
+                action_dim=self.model.action_dim,
+                decode_unroll=self.model.decode_unroll,
+                enc_pred_wm=self.model,
+                **self.cfg.planner,
+            )
         else:
             raise ValueError(f"Unknown planner: {self.cfg.planner}")
 
