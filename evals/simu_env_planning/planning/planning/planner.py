@@ -344,7 +344,7 @@ class CEMPlanner(Planner):
         )
         return result
 
-class GRASPlanner():
+class GRASPlanner(Planner):
     def __init__(
         self,
         unroll: Callable,
@@ -381,9 +381,6 @@ class GRASPlanner():
         self.state_sigma = state_sigma
         self.epsilon = epsilon
         self.var_scale = var_scale
-        self.num_elites = num_elites
-        self.momentum_mean = momentum_mean
-        self.momentum_std = momentum_std
         self.max_norms = max_norms
         self.max_norm_dims = max_norm_dims
         self.num_act_stepped = num_act_stepped

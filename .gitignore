@@ -31,3 +31,4 @@ CLAUDE.md
 simu_env_planning/
 datasets/
 jepa_wm_pusht.pth.tar
+logs/

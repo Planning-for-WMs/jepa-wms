@@ -17,6 +17,7 @@ from evals.simu_env_planning.planning.planning.planner import (
     GradientDescentPlanner,
     MPPIPlanner,
     NevergradPlanner,
+    GRASPlanner
 )
 from src.utils.logging import get_logger
 
