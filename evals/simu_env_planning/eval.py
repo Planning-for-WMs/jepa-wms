@@ -135,7 +135,7 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
     cfg = parse_cfg(cfg)
     set_seed(cfg.meta.seed)
     cfg.rank = rank
-    cfg.world_size = dist.get_world_size()
+    cfg.world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
     cfg.device = device
     cfg.num_active_gpus = cfg.world_size
     cfg.active_ranks = [i for i in range(cfg.world_size)]
@@ -245,7 +245,8 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
                 total_lpips,
                 total_emb_l2,
             ) = evaluator.eval(cfg, agent, env, task_idx=task_idx, ep=ep)
-            dist.barrier()  # should not provoke any error
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()  # should not provoke any error
             episode_end_time = time()
             # Check for duplicate task and episode index
             if (task_idx, ep) in processed_episodes:
@@ -291,9 +292,13 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
         all_results = [None] * cfg.world_size
         log.info(f"{rank=}: {results=}")
         if rank == 0:
-            dist.gather_object(results, object_gather_list=all_results, dst=0)
+            if dist.is_available() and dist.is_initialized():
+                dist.gather_object(results, object_gather_list=all_results, dst=0)
+            else:
+                all_results = [results]
         else:
-            dist.gather_object(results, object_gather_list=None, dst=0)
+            if dist.is_available() and dist.is_initialized():
+                dist.gather_object(results, object_gather_list=None, dst=0)
             combined_results = {}
         if rank == 0:
             combined_results = aggregate_results(cfg, all_results)

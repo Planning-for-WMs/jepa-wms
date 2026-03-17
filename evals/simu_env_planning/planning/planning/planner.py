@@ -878,54 +878,61 @@ class CEMGDPlanner(Planner):
         return actions
 
     def _gd_refine(self, actions_init: torch.Tensor, z_init: torch.Tensor) -> torch.Tensor:
-        """Refine a single action sequence using gradient descent with multiple step sizes.
+        """Refine a single action sequence using per-step backtracking line search.
 
-        Tries J different step sizes (gd_lr_init * gd_lr_decay^j for j=0..J-1), runs G
-        gradient steps with each, and returns the action sequence with the lowest final cost.
+        Runs G gradient steps. At each step, starts from `gd_lr_init` and backtracks by
+        multiplying with `gd_lr_decay` up to `gd_num_lrs` trials, accepting the first
+        candidate that improves the rollout cost.
 
         Args:
             actions_init: (plan_length, action_dim) single action sequence to refine.
             z_init: Initial latent state for rollout.
 
         Returns:
-            best_actions: (plan_length, action_dim) refined action sequence.
+            refined_actions: (plan_length, action_dim) refined action sequence.
         """
-        best_cost = float("inf")
-        best_actions = actions_init.clone()
+        actions = actions_init.clone().unsqueeze(0).detach().requires_grad_(True)  # (1, T, A)
+        decay = self.gd_lr_decay if 0.0 < self.gd_lr_decay < 1.0 else 0.5
 
-        for j in range(self.gd_num_lrs):
-            lr = self.gd_lr_init * (self.gd_lr_decay ** j)
-
-            # Clone the initial actions for this step-size trial: (1, T, A)
-            actions = actions_init.clone().unsqueeze(0).detach().requires_grad_(True)
-
-            for _ in range(self.gd_steps):
-                if actions.grad is not None:
-                    actions.grad.zero_()
-
-                # Rollout: unroll expects (T, B, A)
-                actions_for_unroll = actions.squeeze(0).unsqueeze(1)  # (T, 1, A)
-                predicted_encs = self.unroll(z_init, act_suffix=actions_for_unroll)
-                loss = self.objective(predicted_encs, actions_for_unroll)
-                total_loss = loss.mean()
-                total_loss.backward()
-
-                with torch.no_grad():
-                    actions.data -= lr * actions.grad
-                    actions.data = self._clip_actions(actions.data)
-
+        for _ in range(self.gd_steps):
+            if actions.grad is not None:
                 actions.grad.zero_()
 
-            # Evaluate final cost for this step size
+            # Rollout: unroll expects (T, B, A)
+            actions_for_unroll = actions.squeeze(0).unsqueeze(1)  # (T, 1, A)
+            predicted_encs = self.unroll(z_init, act_suffix=actions_for_unroll)
+            loss = self.objective(predicted_encs, actions_for_unroll)
+            current_cost = loss.mean()
+            current_cost.backward()
+
+            if actions.grad is None:
+                continue
+
             with torch.no_grad():
-                actions_for_unroll = actions.squeeze(0).unsqueeze(1)  # (T, 1, A)
-                final_cost = self.cost_function(actions_for_unroll, z_init).item()
+                grad = actions.grad.detach().clone()
+                if not torch.isfinite(grad).all():
+                    actions.grad.zero_()
+                    continue
 
-            if final_cost < best_cost:
-                best_cost = final_cost
-                best_actions = actions.squeeze(0).detach().clone()
+                base_actions = actions.detach().clone()
+                base_cost = current_cost.detach()
+                lr = self.gd_lr_init
 
-        return best_actions
+                # Backtracking line search: accept first improving step.
+                for _ in range(self.gd_num_lrs):
+                    candidate = self._clip_actions(base_actions - lr * grad)
+                    candidate_for_unroll = candidate.squeeze(0).unsqueeze(1)  # (T, 1, A)
+                    candidate_cost = self.cost_function(candidate_for_unroll, z_init).mean()
+
+                    if torch.isfinite(candidate_cost) and candidate_cost < base_cost:
+                        actions.copy_(candidate)
+                        break
+
+                    lr *= decay
+
+            actions.grad.zero_()
+
+        return actions.squeeze(0).detach().clone()
 
     def plan(
         self,
