@@ -429,8 +429,13 @@ class GRASPlanner(Planner):
 
         # s_0: last context frame, fixed throughout optimization
         s_0 = z_init_visual[:, -1:, ...]  # [B, 1, V, H, W, D]
-        # Proprio for forward_pred: use last context frame's proprio as constant
+        # Proprio for forward_pred: initialize trajectory from last context frame
         proprio_const = z_init_proprio[:, -1:, ...] if z_init_proprio is not None else None  # [B, 1, N, D_prop]
+        # proprio_traj: [B, T, N, D_p] — evolves during sync steps
+        if proprio_const is not None:
+            proprio_traj = proprio_const.expand(-1, plan_length, *proprio_const.shape[2:]).clone()
+        else:
+            proprio_traj = None
         # Goal for loss: last frame of goal encoding
         z_goal_flat = z_goal_visual[:, -1:, ...]  # [B_goal, 1, V, H, W, D]
 
@@ -451,11 +456,18 @@ class GRASPlanner(Planner):
         s_0_squeezed = s_0.squeeze(1)  # [B, V, H, W, D]
         g_squeezed = z_goal_flat.squeeze(1)  # [B, V, H, W, D]
         states_interp = (1 - w) * s_0_squeezed.unsqueeze(0) + w * g_squeezed.unsqueeze(0)  # [T, B, *state_shape]
-        states = (states_interp + self.epsilon * torch.randn_like(states_interp)).detach().requires_grad_(True)
+        states = (states_interp + self.epsilon * torch.randn_like(states_interp)).detach()
+        states[-1] = g_squeezed.clone()
+        states = states.requires_grad_(True)
 
         losses = []
         predicted_best_encs_over_iterations = []
         pred_frames_over_iterations = [] if self.decode_each_iteration else None
+
+        # --- Pre-compute sliding window indices for efficient batch construction ---
+        if plan_length > 1:
+            # Indices for ctxt_window=2 sliding windows: [[0,1], [1,2], ..., [T-2,T-1]]
+            win_idx = torch.arange(plan_length - 1, device=self.device).unsqueeze(1) + torch.arange(2, device=self.device).unsqueeze(0)  # [T-1, 2]
 
         # --- Main GRASP optimization loop ---
         for k in range(self.iterations):
@@ -468,37 +480,66 @@ class GRASPlanner(Planner):
             actions_BTA = actions.permute(1, 0, 2)  # [B, T, A]
             act_feats = self.enc_pred_wm.model.encode_act(actions_BTA)
 
-            # --- Per-step losses (Eq. 8, 9, 10) ---
-            dyn_loss = torch.tensor(0.0, device=self.device)
-            predictions = []
-            for t in range(plan_length):
-                # F_theta(stop_grad(s_t), a_t) — stop-gradient on s_t
-                s_t = full_states[:, t : t + 1].detach()  # [B, 1, V, H, W, D]
-                a_t = act_feats[:, t : t + 1]
-                pred_next, _, _ = self.enc_pred_wm.model.forward_pred(s_t, a_t, proprio_const)
-                # pred_next: [B, 1, V, H, W, D]
+            # --- Batched predictions with proper context window (Eq. 8, 9, 10) ---
+            # AdaLN requires matching video and action time dimensions.
+            # Match unroll behavior: at h=0 with tau=1, use 1 frame + 1 action.
+            # At h>=1, use 2 frames + 2 actions (ctxt_window=2).
 
-                # L_dyn (Eq. 8): ||F(sg(s_t), a_t) - s_{t+1}||^2
-                s_next = full_states[:, t + 1 : t + 2]
-                dyn_loss = dyn_loss + (pred_next - s_next).pow(2).mean()
+            # === Step t=0: 1 frame context (matches unroll h=0 with tau=1) ===
+            vid_ctx_0 = s_0.detach()  # [B, 1, V, H, W, D]
+            act_ctx_0 = act_feats[:, 0:1]  # [B, 1, A]
+            prop_ctx_0 = proprio_const if z_init_proprio is not None else None  # [B, 1, N, D_p]
+            pred_0_full, _, _ = self.enc_pred_wm.model.forward_pred(vid_ctx_0, act_ctx_0, prop_ctx_0)
+            pred_0 = pred_0_full[:, -1]  # [B, V, H, W, D]
 
-                predictions.append(pred_next)
+            # === Steps t=1..T-1: ctxt_window=2 context (matches unroll h>=1) ===
+            if plan_length > 1:
+                # Efficient sliding-window indexing (no list comprehension + cat)
+                # Video: [s_{t-1}, s_t] for t=1..T-1 via fancy indexing
+                vid_batch = full_states[:, win_idx].reshape(
+                    B * (plan_length - 1), 2, *state_shape
+                ).detach()  # [B*(T-1), 2, V, H, W, D]
+                # Actions: [a_{t-1}, a_t] for t=1..T-1
+                act_batch = act_feats[:, win_idx].reshape(
+                    B * (plan_length - 1), 2, self.action_dim
+                )  # [B*(T-1), 2, A]
+                # Proprio: [p_{t-1}, p_t] from full_prop = [p_init, proprio_traj]
+                if z_init_proprio is not None:
+                    full_prop = torch.cat([proprio_const, proprio_traj], dim=1)  # [B, 1+T, N, D_p]
+                    prop_batch = full_prop[:, win_idx].reshape(
+                        B * (plan_length - 1), 2, *proprio_const.shape[2:]
+                    )  # [B*(T-1), 2, N, D_p]
+                else:
+                    prop_batch = None
 
-            # L_goal (Eq. 9): use self.objective on stacked predictions
-            # Stack predictions: [T, B, V, H, W, D] (matching objective's expected shape)
-            pred_stack = torch.cat(predictions, dim=1)  # [B, T, V, H, W, D]
-            pred_stack = pred_stack.permute(1, 0, *range(2, pred_stack.ndim))  # [T, B, V, H, W, D]
-            # Wrap in TensorDict if objective expects it (target_enc is TensorDict)
+                batch_preds_full, _, _ = self.enc_pred_wm.model.forward_pred(
+                    vid_batch, act_batch, prop_batch
+                )
+                batch_preds = batch_preds_full[:, -1]  # [B*(T-1), V, H, W, D]
+                batch_preds = batch_preds.view(plan_length - 1, B, *batch_preds.shape[1:])  # [T-1, B, ...]
+                all_preds = torch.cat([pred_0.unsqueeze(0), batch_preds], dim=0)  # [T, B, V, H, W, D]
+            else:
+                all_preds = pred_0.unsqueeze(0)  # [1, B, V, H, W, D]
+
+            # L_dyn (Eq. 8): ||F(sg(s_t), a_t) - s_{t+1}||^2 summed over t
+            states_target = full_states[:, 1:].permute(
+                1, 0, *range(2, full_states.ndim)
+            )  # [T, B, V, H, W, D]
+            dyn_loss = (all_preds - states_target).pow(2).sum(0).mean()
+
+            # L_goal (Eq. 9): dense goal loss over all timesteps
+            pred_stack = all_preds  # [T, B, V, H, W, D]
             if is_tensordict:
-                # Expand proprio_const [B,1,N,D_p] to [T,B,N,D_p] for objective
-                proprio_expanded = proprio_const.permute(1, 0, *range(2, proprio_const.ndim)).expand(plan_length, -1, *proprio_const.shape[2:])
+                # Use evolving proprio_traj for objective: [B, T, N, D_p] -> [T, B, N, D_p]
+                proprio_expanded = proprio_traj.permute(
+                    1, 0, *range(2, proprio_traj.ndim)
+                )
                 pred_for_obj = TensorDict({"visual": pred_stack, "proprio": proprio_expanded})
             else:
                 pred_for_obj = pred_stack
-            goal_loss = self.objective(pred_for_obj, actions_BTA, keepdims=False)
-            if goal_loss.ndim > 0:
-                goal_loss = goal_loss.mean()
-
+            goal_loss = self.objective(pred_for_obj, actions_BTA, keepdims=True)  # [T, B]
+            goal_loss = goal_loss.sum(0).mean()  # sum over T (dense Eq. 9), mean over B
+            print(k, dyn_loss, goal_loss)
             # Total loss (Eq. 10)
             total_loss = dyn_loss + self.gamma * goal_loss
             losses.append(total_loss.item())
@@ -506,21 +547,22 @@ class GRASPlanner(Planner):
             # --- Compute gradients via autograd (no stored .grad needed) ---
             grad_actions, grad_states = torch.autograd.grad(total_loss, [actions, states])
 
+            # spatial_numel = 1
+            # for s in states.shape[2:]:  # (V, H, W, D) — skip T and B dims
+            #     spatial_numel *= s
+            # grad_states = grad_states * spatial_numel
             # --- Update actions (Eq. 12) and states (Eq. 11) ---
+            grad_states[-1] = 0
+            noise = self.state_sigma * torch.randn_like(states)
+            noise[-1] = 0
             actions = self._clip_actions(actions - self.action_lr * grad_actions).detach().requires_grad_(True)
-            states = (states - self.state_lr * grad_states + self.state_sigma * torch.randn_like(states)).detach().requires_grad_(True)
-
+            states = (states - self.state_lr * grad_states + noise).detach()
+            states[-1] = g_squeezed.clone()
+            states = states.requires_grad_(True)
+            # print(k, dyn_loss.item(), self.gamma*goal_loss.item(), torch.mean(states).item(), torch.mean(actions).item(), self.state_lr * torch.mean(grad_states).item(), self.action_lr * torch.mean(grad_actions).item(), torch.mean(noise).item())
+            # print(actions)
             # --- Periodic sync step ---
             if (k + 1) % self.K_sync == 0:
-                # Rollout from z_init to re-sync states
-                with torch.no_grad():
-                    sync_rollout = self.unroll(z_init, act_suffix=actions.detach())
-                    if is_tensordict:
-                        new_states = sync_rollout["visual"][tau:]  # [T, B, V, H, W, D]
-                    else:
-                        new_states = sync_rollout[tau:]
-                    states = new_states.detach().requires_grad_(True)
-
                 # J_sync GD steps on actions via goal loss through full rollout
                 for _ in range(self.J_sync):
                     actions_for_sync = actions.detach().clone().requires_grad_(True)
@@ -532,6 +574,19 @@ class GRASPlanner(Planner):
                     sync_goal_loss = (final_state - z_goal_flat).pow(2).mean()
                     grad_sync = torch.autograd.grad(sync_goal_loss, actions_for_sync)[0]
                     actions = self._clip_actions(actions - self.sync_lr * grad_sync).detach().requires_grad_(True)
+
+                # Re-sync states and proprio via rollout with current actions
+                with torch.no_grad():
+                    sync_rollout = self.unroll(z_init, act_suffix=actions.detach())
+                    if is_tensordict:
+                        new_states = sync_rollout["visual"][tau:]  # [T, B, V, H, W, D]
+                        new_proprio = sync_rollout["proprio"][tau:]  # [T, B, N, D_p]
+                        proprio_traj = new_proprio.permute(1, 0, *range(2, new_proprio.ndim)).detach()  # [B, T, N, D_p]
+                    else:
+                        new_states = sync_rollout[tau:]
+                    states_data = new_states.detach()
+                    states_data[-1] = g_squeezed.clone()
+                    states = states_data.requires_grad_(True)
 
             # --- Optional: store predictions for visualization ---
             if self.decode_each_iteration and self.decode_unroll is not None:
