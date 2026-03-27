@@ -7,6 +7,7 @@
 
 import math
 from functools import partial
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,65 @@ from src.utils.tensors import trunc_normal_
 logger = get_logger(__name__)
 
 BLOCK_SIZE = 64
+
+
+def bipartite_soft_matching(metric: torch.Tensor, r: int) -> Callable:
+    """Bipartite soft matching for Token Merging (ToMe).
+
+    Args:
+        metric: [B, N, C] tensor of token features used to compute similarity.
+        r: Number of tokens to merge (remove) in this step.
+
+    Returns:
+        merge_fn: callable that takes [B, N, C] and returns [B, N-r, C].
+    """
+    if r <= 0:
+        return lambda x: x
+
+    B, N, _ = metric.shape
+    # Split into set A (even indices) and set B (odd indices)
+    a = metric[:, ::2, :]
+    b = metric[:, 1::2, :]
+
+    # Cosine similarity between each A token and all B tokens
+    a_norm = a / a.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    b_norm = b / b.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    scores = a_norm @ b_norm.transpose(-1, -2)  # [B, num_A, num_B]
+
+    # For each A token, find its most similar B token
+    node_max, node_idx = scores.max(dim=-1)  # [B, num_A]
+
+    # Select the r A tokens with highest similarity to merge
+    edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]  # [B, num_A, 1]
+    unm_idx = edge_idx[..., r:, :].sort(dim=-2)[0]  # unmerged A indices
+    src_idx = edge_idx[..., :r, :]                   # source A indices to merge
+    dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)  # destination B indices
+
+    def merge(x: torch.Tensor) -> torch.Tensor:
+        """Merge tokens in x: [B, N, C] -> [B, N-r, C]."""
+        x_a = x[:, ::2, :]
+        x_b = x[:, 1::2, :]
+        Bx, _, C = x.shape
+        n_a = x_a.shape[1]
+
+        x_unm = x_a.gather(-2, unm_idx.expand(Bx, n_a - r, C))
+        x_src = x_a.gather(-2, src_idx.expand(Bx, r, C))
+        x_dst = x_b.scatter_add(-2, dst_idx.expand(Bx, r, C), x_src)
+        return torch.cat([x_unm, x_dst], dim=-2)
+
+    return merge
+
+
+def _build_causal_block_mask(T: int, N_per_ts: int, device: torch.device) -> torch.Tensor:
+    """Build a causal block-diagonal attention mask for T timesteps with N_per_ts tokens each.
+
+    Each timestep can attend to all tokens in itself and all previous timesteps.
+    """
+    N = T * N_per_ts
+    mask = torch.zeros(N, N, dtype=torch.bool, device=device)
+    for t in range(T):
+        mask[t * N_per_ts : (t + 1) * N_per_ts, : (t + 1) * N_per_ts] = True
+    return mask
 
 
 class FWAdaLNBlock(nn.Module):
@@ -94,7 +154,7 @@ class FWAdaLNBlock(nn.Module):
             B, N, D
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(z).repeat_interleave((self.grid_size**2 + cond_tokens), dim=1).chunk(6, dim=2)
+            self.adaLN_modulation(z).repeat_interleave(x.size(1) // T, dim=1).chunk(6, dim=2)
         )
         if isinstance(self.attn, RoPEAttention):
             y = self.attn(
@@ -160,9 +220,11 @@ class VisionTransformerAdaLN(nn.Module):
         proprio_encoder_inpred=True,
         proprio_tokens=0,  # if proprio_encoding='token', proprio_tokens>0 will be used to encode the proprio input
         action_encoder_inpred=True,
+        tome_r=0,
         **kwargs,
     ):
         super().__init__()
+        self.tome_r = tome_r
         self.attn_depth, self.attn_height, self.attn_width = local_window
         self.predictor_embed_dim = predictor_embed_dim
         self.proprio_encoder_inpred = proprio_encoder_inpred
@@ -345,6 +407,13 @@ class VisionTransformerAdaLN(nn.Module):
             else None
         )
 
+        # Initialize ToMe size tracker: shape [B*T, N_per_ts, 1]
+        if self.tome_r > 0:
+            N_per_ts_init = x.size(1) // T
+            s = torch.ones(B * T, N_per_ts_init, 1, device=x.device, dtype=x.dtype)
+        else:
+            s = None
+
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):
             if self.use_activation_checkpointing:
@@ -371,17 +440,36 @@ class VisionTransformerAdaLN(nn.Module):
                     W_patches=self.grid_width,
                     cond_tokens=self.cond_tokens,
                 )
+
+            # Token Merging: reduce tokens between blocks
+            if self.tome_r > 0:
+                N_cur = x.size(1) // T
+                x_t = x.view(B * T, N_cur, -1)
+                # Use cosine-normalized block output as similarity metric
+                metric = x_t / x_t.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                merge_fn = bipartite_soft_matching(metric, self.tome_r)
+                # Weighted average: un-normalize by size, merge (sum), re-normalize
+                x_t = merge_fn(x_t * s)
+                s = merge_fn(s)
+                x_t = x_t / s
+                N_new = x_t.size(1)
+                x = x_t.view(B, T * N_new, -1)
+                # Rebuild causal block mask for new per-timestep token count
+                if self.attn_mask is not None:
+                    attn_mask = _build_causal_block_mask(T, N_new, device=x.device)
+
         x = self.predictor_norm(x)
 
+        N_final = x.size(1) // T
         if self.use_proprio and proprio is not None:
             if self.proprio_encoding == "token":
-                x = x.view(B, T, self.cond_tokens + self.grid_height * self.grid_width, D)  # [B, T, K+H*W, D]
+                x = x.view(B, T, N_final, D)  # [B, T, K+H*W, D] (K=cond_tokens already in N_final)
                 x, proprio_features = x[:, :, self.cond_tokens :, :], x[:, :, : self.cond_tokens, :]
             elif self.proprio_encoding == "feature":
-                x = x.view(B, T, self.grid_height * self.grid_width, self.predictor_total_embed_dim)
+                x = x.view(B, T, N_final, self.predictor_total_embed_dim)
                 x, proprio_features = x[:, :, :, : -self.proprio_emb_dim], x[:, :, :, -self.proprio_emb_dim :]
         else:
-            x = x.view(B, T, self.grid_height * self.grid_width, self.predictor_total_embed_dim)
+            x = x.view(B, T, N_final, self.predictor_total_embed_dim)
             proprio_features = None
 
         x = self.predictor_proj(x)

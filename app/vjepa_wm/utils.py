@@ -587,6 +587,7 @@ def init_video_model(
     cfgs_attn_pattern=None,
     use_activation_checkpointing=False,
     init_scale_factor_adaln=10,
+    tome_r=0,
     # Action configuration
     action_dim=7,
     action_conditioning="token",
@@ -782,6 +783,7 @@ def init_video_model(
             proprio_emb_dim=proprio_emb_dim,
             proprio_tokens=proprio_tokens,
             init_scale_factor_adaln=init_scale_factor_adaln,
+            tome_r=tome_r,
         ).to(device)
     logger.info(f"Predictor: {predictor}")
     pred_params = sum(p.numel() for p in predictor.parameters())
