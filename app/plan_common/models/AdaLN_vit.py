@@ -39,31 +39,36 @@ def bipartite_soft_matching(metric: torch.Tensor, r: int, metric_dim: int = 64) 
         (merge_fn, merge_positions_fn, unmerge_fn): callables that reduce
         [B, N, C] -> [B, N-r, C] and [B, N] -> [B, N-r] positions respectively.
     """
+    B, N, C = metric.shape
+
+    # We can only reduce by a maximum of 50% tokens
+    r = min(r, N // 2)
+
     if r <= 0:
         return lambda x: x, lambda p: p, lambda x: x
 
-    B, N, C = metric.shape
-    # Use a low-dimensional slice for faster similarity computation
-    if metric_dim > 0 and metric_dim < C:
-        metric = metric[:, :, :metric_dim]
+    with torch.no_grad():
+        # Use a low-dimensional slice for faster similarity computation
+        if metric_dim > 0 and metric_dim < C:
+            metric = metric[:, :, :metric_dim]
 
-    # Split into set A (even indices) and set B (odd indices)
-    a = metric[:, ::2, :]
-    b = metric[:, 1::2, :]
+        # Split into set A (even indices) and set B (odd indices)
+        a = metric[:, ::2, :]
+        b = metric[:, 1::2, :]
 
-    # Cosine similarity between each A token and all B tokens
-    a_norm = a / a.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    b_norm = b / b.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    scores = a_norm @ b_norm.transpose(-1, -2)  # [B, num_A, num_B]
+        # Cosine similarity between each A token and all B tokens
+        a_norm = a / a.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        b_norm = b / b.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        scores = a_norm @ b_norm.transpose(-1, -2)  # [B, num_A, num_B]
 
-    # For each A token, find its most similar B token
-    node_max, node_idx = scores.max(dim=-1)  # [B, num_A]
+        # For each A token, find its most similar B token
+        node_max, node_idx = scores.max(dim=-1)  # [B, num_A]
 
-    # Select the r A tokens with highest similarity to merge
-    edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]  # [B, num_A, 1]
-    unm_idx = edge_idx[..., r:, :].sort(dim=-2)[0]  # unmerged A indices
-    src_idx = edge_idx[..., :r, :]                   # source A indices to merge
-    dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)  # destination B indices
+        # Select the r A tokens with highest similarity to merge
+        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]  # [B, num_A, 1]
+        unm_idx = edge_idx[..., r:, :].sort(dim=-2)[0]  # unmerged A indices
+        src_idx = edge_idx[..., :r, :]                   # source A indices to merge
+        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)  # destination B indices
 
     num_A = a.shape[1]
 
@@ -495,16 +500,18 @@ class VisionTransformerAdaLN(nn.Module):
         tome_uniform = self.tome_r > 0 and self.tome_mode == "uniform"
 
         if tome_history:
-            # History-only mode: merge only timestep 0 (history), keep timestep T-1 (current) intact
-            N_hist = N_per_ts_init  # tracks history token count (decreases per block)
-            N_curr = N_per_ts_init  # current timestep token count (constant)
-            s_hist = torch.ones(B, N_per_ts_init, 1, device=x.device, dtype=x.dtype)
+            # History-only mode: merge timesteps 0..T-2 (history), keep timestep T-1 (current) intact.
+            # per_ts_counts[t] tracks the current token count for timestep t.
+            T_hist = T - 1
+            per_ts_counts = [N_per_ts_init] * T  # [n_0, n_1, ..., n_{T-1}]
+            # Size tracker for weighted averaging: [B * T_hist, N_per_ts_init, 1]
+            s_hist = torch.ones(B * T_hist, N_per_ts_init, 1, device=x.device, dtype=x.dtype)
             if self.use_rope:
                 N_frame_orig = N_per_ts_init - self.cond_tokens
-                pos_ids_hist = torch.arange(N_per_ts_init, device=x.device).unsqueeze(0).expand(B, -1).contiguous()
-                # Static positions for current timestep (offset by one frame worth of positions)
+                # Position IDs for each history timestep: [B * T_hist, N_per_ts_init]
+                pos_ids_hist = torch.arange(N_per_ts_init, device=x.device).unsqueeze(0).expand(B * T_hist, -1).contiguous()
+                # Static positions for current (last) timestep: [B, N_per_ts_init]
                 pos_ids_curr = torch.arange(N_per_ts_init, device=x.device).unsqueeze(0).expand(B, -1).contiguous()
-                curr_offset = N_frame_orig  # global offset for timestep 1
         elif tome_uniform:
             s = torch.ones(B * T, N_per_ts_init, 1, device=x.device, dtype=x.dtype)
             if self.use_rope:
@@ -522,13 +529,19 @@ class VisionTransformerAdaLN(nn.Module):
         for i, blk in enumerate(self.predictor_blocks):
             # --- Build RoPE position mask ---
             if tome_history and self.use_rope:
-                # History positions (may be merged/reduced)
-                hist_frame = pos_ids_hist[:, self.cond_tokens:]  # [B, N_hist_frame]
-                hist_global = hist_frame - self.cond_tokens  # offset=0 for timestep 0
-                # Current positions (always full)
+                N_frame_orig = N_per_ts_init - self.cond_tokens
+                # History: reshape pos_ids_hist from [B*T_hist, n_hist_t] to per-batch, per-timestep
+                # Each history timestep t has global offset t * N_frame_orig
+                parts = []
+                n_hist_t = per_ts_counts[0]  # all history timesteps have same count (merged uniformly)
+                for t in range(T_hist):
+                    # pos_ids_hist is [B*T_hist, n_hist_t]; slice for this timestep
+                    pid = pos_ids_hist[t * B : (t + 1) * B, self.cond_tokens:]  # [B, n_hist_t - cond]
+                    parts.append(pid - self.cond_tokens + t * N_frame_orig)
+                # Current timestep
                 curr_frame = pos_ids_curr[:, self.cond_tokens:]  # [B, N_curr_frame]
-                curr_global = curr_frame - self.cond_tokens + curr_offset
-                rope_mask = torch.cat([hist_global, curr_global], dim=1)  # [B, N_hist_frame + N_curr_frame]
+                parts.append(curr_frame - self.cond_tokens + T_hist * N_frame_orig)
+                rope_mask = torch.cat(parts, dim=1)  # [B, sum of frame tokens]
             elif tome_uniform and self.use_rope and pos_ids is not None:
                 frame_local = pos_ids[:, self.cond_tokens:]
                 global_frame_pos = frame_local - self.cond_tokens + t_offsets
@@ -537,7 +550,7 @@ class VisionTransformerAdaLN(nn.Module):
                 rope_mask = None
 
             # --- Compute token_counts for asymmetric AdaLN expansion ---
-            tc = [N_hist, N_curr] if tome_history else None
+            tc = list(per_ts_counts) if tome_history else None
 
             # --- ATTENTION HALF (full token count) ---
             if self.use_activation_checkpointing:
@@ -571,31 +584,38 @@ class VisionTransformerAdaLN(nn.Module):
             # Skip last block: tokens would be unmerged immediately after
             if (tome_history or tome_uniform) and i < num_blocks - 1:
                 if tome_history:
-                    # Merge only history (first N_hist) tokens
-                    x_hist = x[:, :N_hist, :]
-                    x_curr = x[:, N_hist:, :]
-                    r_actual = min(self.tome_r, N_hist // 2 - 1)
-                    merge_fn, merge_fn_pos, unmerge_fn = bipartite_soft_matching(x_hist, r_actual)
+                    # Split x into history timesteps and current timestep
+                    N_hist_total = sum(per_ts_counts[:T_hist])
+                    x_hist_all = x[:, :N_hist_total, :]
+                    x_curr = x[:, N_hist_total:, :]
+                    # Reshape history into [B * T_hist, n_hist_t, D] for batched merging
+                    n_hist_t = per_ts_counts[0]  # all history timesteps have same count
+                    x_hist_bt = x_hist_all.reshape(B, T_hist, n_hist_t, -1).reshape(B * T_hist, n_hist_t, -1)
+                    merge_fn, merge_fn_pos, unmerge_fn = bipartite_soft_matching(x_hist_bt, self.tome_r)
                     unmerge_fns.append(unmerge_fn)
-                    # Weighted-average merge of history tokens
-                    x_hist = merge_fn(x_hist * s_hist)
+                    # Weighted-average merge
+                    x_hist_bt = merge_fn(x_hist_bt * s_hist)
                     s_hist = merge_fn(s_hist)
-                    x_hist = x_hist / s_hist
-                    N_hist = x_hist.size(1)
-                    x = torch.cat([x_hist, x_curr], dim=1)
-                    # Update RoPE positions for history only
+                    x_hist_bt = x_hist_bt / s_hist
+                    n_hist_new = x_hist_bt.size(1)
+                    # Reshape back to [B, T_hist * n_hist_new, D]
+                    x_hist_all = x_hist_bt.reshape(B, T_hist * n_hist_new, -1)
+                    x = torch.cat([x_hist_all, x_curr], dim=1)
+                    # Update per-timestep counts
+                    for t in range(T_hist):
+                        per_ts_counts[t] = n_hist_new
+                    # Update RoPE positions for history
                     if self.use_rope:
                         pos_ids_hist = merge_fn_pos(pos_ids_hist)
                     # Rebuild asymmetric attention mask
                     if self.attn_mask is not None:
-                        attn_mask = _build_asymmetric_causal_block_mask([N_hist, N_curr], device=x.device)
-                    tc = [N_hist, N_curr]
+                        attn_mask = _build_asymmetric_causal_block_mask(per_ts_counts, device=x.device)
+                    tc = list(per_ts_counts)
                 else:
                     # Uniform merging across all timesteps
                     N_cur = x.size(1) // T
                     x_t = x.view(B * T, N_cur, -1)
-                    r_actual = min(self.tome_r, N_cur // 2 - 1)
-                    merge_fn, merge_fn_pos, unmerge_fn = bipartite_soft_matching(x_t, r_actual)
+                    merge_fn, merge_fn_pos, unmerge_fn = bipartite_soft_matching(x_t, self.tome_r)
                     unmerge_fns.append(unmerge_fn)
                     x_t = merge_fn(x_t * s)
                     s = merge_fn(s)
@@ -623,11 +643,15 @@ class VisionTransformerAdaLN(nn.Module):
         # Unmerge to restore original token counts for output shape compatibility
         if tome_history and unmerge_fns:
             # Unmerge only history tokens (current timestep was never merged)
-            x_hist = x[:, :N_hist, :]
-            x_curr = x[:, N_hist:, :]
+            N_hist_total = sum(per_ts_counts[:T_hist])
+            x_hist_all = x[:, :N_hist_total, :]
+            x_curr = x[:, N_hist_total:, :]
+            n_hist_t = per_ts_counts[0]
+            x_hist_bt = x_hist_all.reshape(B, T_hist, n_hist_t, -1).reshape(B * T_hist, n_hist_t, -1)
             for ufn in reversed(unmerge_fns):
-                x_hist = ufn(x_hist)
-            x = torch.cat([x_hist, x_curr], dim=1)  # [B, T*N_per_ts_init, D]
+                x_hist_bt = ufn(x_hist_bt)
+            x_hist_all = x_hist_bt.reshape(B, T_hist * N_per_ts_init, -1)
+            x = torch.cat([x_hist_all, x_curr], dim=1)  # [B, T*N_per_ts_init, D]
         elif tome_uniform and unmerge_fns:
             N_cur = x.size(1) // T
             x_t = x.view(B * T, N_cur, -1)

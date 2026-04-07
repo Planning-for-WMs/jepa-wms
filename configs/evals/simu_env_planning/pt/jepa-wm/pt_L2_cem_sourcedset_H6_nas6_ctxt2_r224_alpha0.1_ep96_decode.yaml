@@ -176,7 +176,7 @@ model_kwargs:
       - 0.224
       - 0.225
   wrapper_kwargs:
-    ctxt_window: 2
+    ctxt_window: 3
 task_specification:
   task: pusht-base
   obs: rgb_state
