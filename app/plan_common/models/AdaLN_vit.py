@@ -27,20 +27,26 @@ logger = get_logger(__name__)
 BLOCK_SIZE = 64
 
 
-def bipartite_soft_matching(metric: torch.Tensor, r: int) -> Callable:
+def bipartite_soft_matching(metric: torch.Tensor, r: int, metric_dim: int = 64) -> Callable:
     """Bipartite soft matching for Token Merging (ToMe).
 
     Args:
         metric: [B, N, C] tensor of token features used to compute similarity.
         r: Number of tokens to merge (remove) in this step.
+        metric_dim: Number of channels to use for similarity (lower = faster). 0 = use all.
 
     Returns:
-        merge_fn: callable that takes [B, N, C] and returns [B, N-r, C].
+        (merge_fn, merge_positions_fn, unmerge_fn): callables that reduce
+        [B, N, C] -> [B, N-r, C] and [B, N] -> [B, N-r] positions respectively.
     """
     if r <= 0:
-        return lambda x: x
+        return lambda x: x, lambda p: p, lambda x: x
 
-    B, N, _ = metric.shape
+    B, N, C = metric.shape
+    # Use a low-dimensional slice for faster similarity computation
+    if metric_dim > 0 and metric_dim < C:
+        metric = metric[:, :, :metric_dim]
+
     # Split into set A (even indices) and set B (odd indices)
     a = metric[:, ::2, :]
     b = metric[:, 1::2, :]
@@ -59,6 +65,8 @@ def bipartite_soft_matching(metric: torch.Tensor, r: int) -> Callable:
     src_idx = edge_idx[..., :r, :]                   # source A indices to merge
     dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)  # destination B indices
 
+    num_A = a.shape[1]
+
     def merge(x: torch.Tensor) -> torch.Tensor:
         """Merge tokens in x: [B, N, C] -> [B, N-r, C]."""
         x_a = x[:, ::2, :]
@@ -71,7 +79,35 @@ def bipartite_soft_matching(metric: torch.Tensor, r: int) -> Callable:
         x_dst = x_b.scatter_add(-2, dst_idx.expand(Bx, r, C), x_src)
         return torch.cat([x_unm, x_dst], dim=-2)
 
-    return merge
+    def merge_positions(pos: torch.Tensor) -> torch.Tensor:
+        """Select surviving token positions (no summation). pos: [B, N] integer indices."""
+        pos_a = pos[:, ::2]   # [B, num_A]
+        pos_b = pos[:, 1::2]  # [B, num_B]
+        Bx = pos.shape[0]
+        # Gather unmerged A positions; B positions are kept as-is (they absorb src tokens)
+        pos_unm = pos_a.gather(-1, unm_idx.squeeze(-1).expand(Bx, num_A - r))
+        return torch.cat([pos_unm, pos_b], dim=-1)
+
+    num_B = N // 2
+
+    def unmerge(x: torch.Tensor) -> torch.Tensor:
+        """Unmerge: [B, N-r, C] -> [B, N, C]. Merged src tokens take their dst's value."""
+        Bx, _, C = x.shape
+        x_unm = x[:, : num_A - r, :]   # unmerged A tokens
+        x_dst = x[:, num_A - r :, :]   # all B tokens (num_B of them)
+        # Merged A (src) tokens: give them a copy of their destination B token's value
+        x_src = x_dst.gather(-2, dst_idx.expand(Bx, r, C))
+        # Reconstruct full A by placing unmerged and source tokens at original positions
+        x_a = torch.empty(Bx, num_A, C, device=x.device, dtype=x.dtype)
+        x_a.scatter_(-2, unm_idx.expand(Bx, num_A - r, C), x_unm)
+        x_a.scatter_(-2, src_idx.expand(Bx, r, C), x_src)
+        # Interleave A (even) and B (odd) back to the original N-token layout
+        x_full = torch.empty(Bx, N, C, device=x.device, dtype=x.dtype)
+        x_full[:, ::2, :] = x_a
+        x_full[:, 1::2, :] = x_dst
+        return x_full
+
+    return merge, merge_positions, unmerge
 
 
 def _build_causal_block_mask(T: int, N_per_ts: int, device: torch.device) -> torch.Tensor:
@@ -145,16 +181,17 @@ class FWAdaLNBlock(nn.Module):
 
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
 
-    def forward(self, x, z, mask=None, attn_mask=None, T=None, H_patches=None, W_patches=None, cond_tokens=0):
-        """
-        Input:
-            x : B, N, C with N = T*H*W
-            z : B, T, D
+    def forward_attn(self, x, z, mask=None, attn_mask=None, T=None, H_patches=None, W_patches=None, cond_tokens=0):
+        """Run attention half of the block.
+
         Returns:
-            B, N, D
+            x: post-attention features [B, N, D]
+            mod_raw: raw AdaLN modulation [B, T, 6*D] (re-usable for MLP after token merging)
         """
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(z).repeat_interleave(x.size(1) // T, dim=1).chunk(6, dim=2)
+        mod_raw = self.adaLN_modulation(z)  # [B, T, 6*D]
+        N_per_ts = x.size(1) // T
+        shift_msa, scale_msa, gate_msa, _, _, _ = (
+            mod_raw.repeat_interleave(N_per_ts, dim=1).chunk(6, dim=2)
         )
         if isinstance(self.attn, RoPEAttention):
             y = self.attn(
@@ -173,7 +210,27 @@ class FWAdaLNBlock(nn.Module):
                 attn_mask=attn_mask,
             )
         x = x + self.drop_path(y * gate_msa)
+        return x, mod_raw
+
+    def forward_mlp(self, x, mod_raw, T):
+        """Run MLP half of the block. x may have fewer tokens than during forward_attn (post-merge)."""
+        N_per_ts = x.size(1) // T
+        _, _, _, shift_mlp, scale_mlp, gate_mlp = (
+            mod_raw.repeat_interleave(N_per_ts, dim=1).chunk(6, dim=2)
+        )
         x = x + self.drop_path(gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)))
+        return x
+
+    def forward(self, x, z, mask=None, attn_mask=None, T=None, H_patches=None, W_patches=None, cond_tokens=0):
+        """
+        Input:
+            x : B, N, C with N = T*H*W
+            z : B, T, D
+        Returns:
+            B, N, D
+        """
+        x, mod_raw = self.forward_attn(x, z, mask, attn_mask, T, H_patches, W_patches, cond_tokens)
+        x = self.forward_mlp(x, mod_raw, T)
         return x
 
 
@@ -408,32 +465,56 @@ class VisionTransformerAdaLN(nn.Module):
         )
 
         # Initialize ToMe size tracker: shape [B*T, N_per_ts, 1]
+        N_per_ts_init = x.size(1) // T
         if self.tome_r > 0:
-            N_per_ts_init = x.size(1) // T
             s = torch.ones(B * T, N_per_ts_init, 1, device=x.device, dtype=x.dtype)
+            unmerge_fns = []
+            if self.use_rope:
+                # Track local per-timestep token positions for RoPE mask updates after merging.
+                # pos_ids[bt, j] = original local position of token j in planning timestep bt%T.
+                pos_ids = torch.arange(N_per_ts_init, device=x.device).unsqueeze(0).expand(B * T, -1).contiguous()
+                # Per-timestep offset to convert local positions to global RoPE positions.
+                N_frame_orig = N_per_ts_init - self.cond_tokens
+                t_offsets = (torch.arange(B * T, device=x.device) % T * N_frame_orig).unsqueeze(1)  # [B*T, 1]
+            else:
+                pos_ids = None
         else:
             s = None
+            pos_ids = None
+            unmerge_fns = []
 
         # Fwd prop
+        num_blocks = len(self.predictor_blocks)
         for i, blk in enumerate(self.predictor_blocks):
+            # Build RoPE position mask from tracked surviving positions.
+            # After merging, N_cur < T*H*W so we must pass explicit positions to RoPEAttention
+            # instead of letting it regenerate arange(T*H*W) which would have the wrong size.
+            if self.use_rope and pos_ids is not None:
+                frame_local = pos_ids[:, self.cond_tokens:]  # [B*T, N_frame_cur]
+                global_frame_pos = frame_local - self.cond_tokens + t_offsets  # [B*T, N_frame_cur]
+                rope_mask = global_frame_pos.view(B, -1)  # [B, T*N_frame_cur]
+            else:
+                rope_mask = None
+
+            # --- ATTENTION HALF (full token count) ---
             if self.use_activation_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(
-                    blk,
+                x, mod_raw = torch.utils.checkpoint.checkpoint(
+                    blk.forward_attn,
                     x,
                     z,
-                    None,
+                    rope_mask,
                     attn_mask,
-                    T=T,
-                    H_patches=self.grid_height,
-                    W_patches=self.grid_width,
+                    T,
+                    self.grid_height,
+                    self.grid_width,
+                    self.cond_tokens,
                     use_reentrant=False,
-                    cond_tokens=self.cond_tokens,
                 )
             else:
-                x = blk(
+                x, mod_raw = blk.forward_attn(
                     x,
                     z,
-                    mask=None,
+                    mask=rope_mask,
                     attn_mask=attn_mask,
                     T=T,
                     H_patches=self.grid_height,
@@ -441,22 +522,49 @@ class VisionTransformerAdaLN(nn.Module):
                     cond_tokens=self.cond_tokens,
                 )
 
-            # Token Merging: reduce tokens between blocks
-            if self.tome_r > 0:
+            # --- TOKEN MERGING (between attention and MLP) ---
+            # Skip last block: tokens would be unmerged immediately after
+            if self.tome_r > 0 and i < num_blocks - 1:
                 N_cur = x.size(1) // T
                 x_t = x.view(B * T, N_cur, -1)
-                # Use cosine-normalized block output as similarity metric
-                metric = x_t / x_t.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-                merge_fn = bipartite_soft_matching(metric, self.tome_r)
+                # Clamp r so we don't try to merge more tokens than available in set A (even indices)
+                r_actual = min(self.tome_r, N_cur // 2 - 1)
+                # Use post-attention output as similarity metric (normalization done inside)
+                merge_fn, merge_fn_pos, unmerge_fn = bipartite_soft_matching(x_t, r_actual)
+                unmerge_fns.append(unmerge_fn)
                 # Weighted average: un-normalize by size, merge (sum), re-normalize
                 x_t = merge_fn(x_t * s)
                 s = merge_fn(s)
                 x_t = x_t / s
                 N_new = x_t.size(1)
                 x = x_t.view(B, T * N_new, -1)
-                # Rebuild causal block mask for new per-timestep token count
+                # Update position tracker so next block gets correct RoPE positions
+                if self.use_rope:
+                    pos_ids = merge_fn_pos(pos_ids)
+                # Rebuild causal block mask for new token count
                 if self.attn_mask is not None:
                     attn_mask = _build_causal_block_mask(T, N_new, device=x.device)
+
+            # --- MLP HALF (reduced token count after merging!) ---
+            if self.use_activation_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(
+                    blk.forward_mlp,
+                    x,
+                    mod_raw,
+                    T,
+                    use_reentrant=False,
+                )
+            else:
+                x = blk.forward_mlp(x, mod_raw, T)
+
+        # Unmerge: restore original N_per_ts_init tokens per timestep by reversing all merges.
+        # Merged src tokens take their destination's value (nearest-neighbor approximation).
+        if unmerge_fns:
+            N_cur = x.size(1) // T
+            x_t = x.view(B * T, N_cur, -1)
+            for ufn in reversed(unmerge_fns):
+                x_t = ufn(x_t)
+            x = x_t.view(B, T * N_per_ts_init, -1)
 
         x = self.predictor_norm(x)
 
