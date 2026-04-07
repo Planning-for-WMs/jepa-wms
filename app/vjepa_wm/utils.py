@@ -567,6 +567,7 @@ def init_video_model(
     enc_type="vjepa",
     enc_version="v1",
     enc_name="vit_large",
+    feature_key="x_norm_patchtokens",
     pretrain_enc_path=None,
     pretrain_enc_ckpt_key="target_encoder",
     enc_use_rope=False,
@@ -685,19 +686,40 @@ def init_video_model(
     elif enc_type == "dino":
         encoder = DinoEncoder(
             name=enc_version,
-            feature_key="x_norm_patchtokens",
+            feature_key=feature_key,
         ).to(device)
         for p in encoder.parameters():
             p.requires_grad = False
         encoder = encoder.eval()
-    logger.info(f"Encoder: {encoder}")
-    assert (
-        img_size % encoder.patch_size == 0
-    ), f"Image size {img_size} should be divisible by encoder patch size {encoder.patch_size}"
-    enc_params = sum(p.numel() for p in encoder.parameters())
-    logger.info(
-        f"🧠 Encoder: {type(encoder).__name__} ({enc_params:,} params, frozen={not any(p.requires_grad for p in encoder.parameters())})"
-    )
+    elif enc_type == "precomputed":
+        encoder = None
+        logger.info("Using precomputed features — no encoder loaded")
+
+    if encoder is not None:
+        logger.info(f"Encoder: {encoder}")
+        assert (
+            img_size % encoder.patch_size == 0
+        ), f"Image size {img_size} should be divisible by encoder patch size {encoder.patch_size}"
+        enc_params = sum(p.numel() for p in encoder.parameters())
+        logger.info(
+            f"🧠 Encoder: {type(encoder).__name__} ({enc_params:,} params, frozen={not any(p.requires_grad for p in encoder.parameters())})"
+        )
+
+    # Compute effective grid size: 1 for CLS token, img_size//patch_size for patch tokens
+    if enc_type == "precomputed":
+        # grid_size passed via kwargs from config
+        effective_grid_size = kwargs.get("grid_size", 1)
+        # Use a synthetic patch_size so predictor math works: pred_img_size / patch_size = grid_size
+        encoder_patch_size = 14  # default DINO patch size
+        pred_img_size = effective_grid_size * encoder_patch_size
+    elif enc_type == "dino" and encoder.latent_ndim == 1:
+        effective_grid_size = 1
+        encoder_patch_size = encoder.patch_size
+        pred_img_size = effective_grid_size * encoder_patch_size
+    else:
+        effective_grid_size = img_size // encoder.patch_size
+        encoder_patch_size = encoder.patch_size
+        pred_img_size = effective_grid_size * encoder_patch_size
 
     if pred_type == "none":
         # No predictor, action encoder, or proprio encoder
@@ -760,8 +782,8 @@ def init_video_model(
         assert action_conditioning == "token"
         assert proprio_encoder_inpred == False
         predictor = vit_predictor_AdaLN(
-            img_size=img_size,
-            patch_size=encoder.patch_size,
+            img_size=pred_img_size,
+            patch_size=encoder_patch_size,
             num_frames=num_frames_pred,
             tubelet_size=tubelet_size,
             embed_dim=embed_dim,

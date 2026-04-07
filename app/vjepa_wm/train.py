@@ -343,6 +343,8 @@ def main(args, resume_preempt=False):
             # overridden by quick_debug
             "filter_first_episodes": filter_first_episodes,  # Potentially overridden by mode
             "num_workers": num_workers,
+            # For precomputed features dataset
+            "grid_size": cfgs_model.get("grid_size", 14),
         }
     )
 
