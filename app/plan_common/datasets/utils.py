@@ -59,8 +59,8 @@ def init_data(
     dataset_fpcs=[16],
     mpk_manifest_patterns: list[str] = None,
     custom_teleop_dset=False,
-    droid_fraction=1,
-    val_droid_fraction=1,
+    dset_fraction=1,
+    val_dset_fraction=1,
     # RoboCasa-specific parameters
     output_rcasa_state=False,
     output_rcasa_info=False,
@@ -101,7 +101,7 @@ def init_data(
                 camera_frame=camera_frame,
                 droid_to_rcasa_action_format=droid_to_rcasa_action_format,
                 seed=seed,
-                droid_fraction=droid_fraction,
+                dset_fraction=dset_fraction,
                 action_skip=action_skip,
             )
             if val_data_paths:
@@ -116,7 +116,7 @@ def init_data(
                     camera_frame=camera_frame,
                     droid_to_rcasa_action_format=droid_to_rcasa_action_format,
                     seed=seed,
-                    droid_fraction=val_droid_fraction,
+                    dset_fraction=val_dset_fraction,
                     action_skip=action_skip,
                 )
             datasets = {"train": dataset, "valid": val_dataset}
@@ -138,6 +138,7 @@ def init_data(
                 with_reward=with_reward,
                 random_seed=seed,
                 process_actions=process_actions,
+                dset_fraction=dset_fraction,
             )
             dataset = datasets["train"]
             shuffle = True
@@ -156,6 +157,7 @@ def init_data(
                 with_velocity=True,
                 random_seed=seed,
                 process_actions=process_actions,
+                dset_fraction=dset_fraction,
             )
             dataset = datasets["train"]
             shuffle = False
@@ -175,6 +177,7 @@ def init_data(
                 traj_subset=traj_subset,
                 random_seed=seed,
                 process_actions=process_actions,
+                dset_fraction=dset_fraction,
             )
             dataset = datasets["train"]
             shuffle = False
@@ -193,6 +196,7 @@ def init_data(
                 traj_subset=traj_subset,
                 random_seed=seed,
                 process_actions=process_actions,
+                dset_fraction=dset_fraction,
             )
             dataset = datasets["train"]
         elif all("robocasa" in p for p in data_paths):
@@ -218,6 +222,7 @@ def init_data(
                 rcasa_to_droid_action_format=rcasa_to_droid_action_format,
                 custom_teleop_dset=custom_teleop_dset,
                 camera_views=val_dataset_camera_views,
+                dset_fraction=dset_fraction,
             )
             dataset = datasets["train"]
         else:

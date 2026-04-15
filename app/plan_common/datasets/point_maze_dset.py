@@ -23,6 +23,7 @@ class PointMazeDataset(TrajDataset):
         transform: Optional[Callable] = None,
         normalize_action: bool = False,
         action_scale=1.0,
+        dset_fraction: float = 1.0,
     ):
         self.data_path = Path(data_path)
         self.transform = transform
@@ -41,6 +42,13 @@ class PointMazeDataset(TrajDataset):
         self.states = self.states[:n]
         self.actions = self.actions[:n]
         self.seq_lengths = self.seq_lengths[:n]
+        if dset_fraction < 1.0:
+            num_keep = max(1, int(n * dset_fraction))
+            self.states = self.states[:num_keep]
+            self.actions = self.actions[:num_keep]
+            self.seq_lengths = self.seq_lengths[:num_keep]
+            log.info(f"Slicing PointMaze dataset from {n} to {num_keep} samples ({dset_fraction*100:.1f}%)")
+            n = num_keep
         self.proprios = self.states.clone()
         log.info(f"✅ Loaded {n} PointMaze rollouts")
 
@@ -120,12 +128,14 @@ def load_point_maze_slice_train_val(
     traj_subset=True,
     random_seed=42,
     process_actions="concat",
+    dset_fraction: float = 1.0,
 ):
     dset = PointMazeDataset(
         n_rollout=n_rollout,
         transform=transform,
         data_path=data_path,
         normalize_action=normalize_action,
+        dset_fraction=dset_fraction,
     )
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
         traj_dataset=dset,

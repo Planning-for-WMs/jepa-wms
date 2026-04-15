@@ -61,7 +61,7 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         droid_to_rcasa_action_format: int = 1,
         local: bool = True,
         seed: int = None,
-        droid_fraction: float = 1.0,
+        dset_fraction: float = 1.0,
     ):
         self.data_path = data_path
         self.frames_per_clip = frames_per_clip
@@ -103,11 +103,11 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
             debug = False
 
         # Apply dataset fraction slicing
-        if droid_fraction < 1.0:
+        if dset_fraction < 1.0:
             original_len = len(self.samples)
-            num_samples = max(1, int(original_len * droid_fraction))
+            num_samples = max(1, int(original_len * dset_fraction))
             self.samples = self.samples[:num_samples]
-            logger.info(f"Slicing dataset from {original_len} to {num_samples} samples ({droid_fraction*100:.1f}%)")
+            logger.info(f"Slicing dataset from {original_len} to {num_samples} samples ({dset_fraction*100:.1f}%)")
         else:
             logger.info(f"Not slicing DROID dataset, using {len(self.samples)} samples, 100% of video paths")
         # Taken from other custom datasets

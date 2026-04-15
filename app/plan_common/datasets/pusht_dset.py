@@ -36,6 +36,7 @@ class PushTDataset(TrajDataset):
         relative=True,
         action_scale=100.0,
         with_velocity: bool = True,  # agent's velocity
+        dset_fraction: float = 1.0,
     ):
         self.data_path = Path(data_path)
         self.transform = transform
@@ -71,6 +72,7 @@ class PushTDataset(TrajDataset):
         self.states = self.states[:n]
         self.actions = self.actions[:n]
         self.seq_lengths = self.seq_lengths[:n]
+        self.shapes = self.shapes[:n]
         self.proprios = self.states[..., :2].clone()  # For pusht, first 2 dim of states is proprio
         # load velocities and update states and proprios
         self.with_velocity = with_velocity
@@ -79,6 +81,17 @@ class PushTDataset(TrajDataset):
             self.velocities = self.velocities[:n].float()
             self.states = torch.cat([self.states, self.velocities], dim=-1)
             self.proprios = torch.cat([self.proprios, self.velocities], dim=-1)
+        if dset_fraction < 1.0:
+            num_keep = max(1, int(n * dset_fraction))
+            self.states = self.states[:num_keep]
+            self.actions = self.actions[:num_keep]
+            self.seq_lengths = self.seq_lengths[:num_keep]
+            self.proprios = self.proprios[:num_keep]
+            self.shapes = self.shapes[:num_keep]
+            if with_velocity:
+                self.velocities = self.velocities[:num_keep]
+            log.info(f"Slicing PushT dataset from {n} to {num_keep} samples ({dset_fraction*100:.1f}%)")
+            n = num_keep
         log.info(f"✅ Loaded {n} PushT rollouts")
 
         self.action_dim = self.actions.shape[-1]
@@ -151,6 +164,7 @@ def load_pusht_slice_train_val(
     with_velocity=True,
     random_seed=42,
     process_actions="concat",
+    dset_fraction: float = 1.0,
 ):
     train_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -158,6 +172,7 @@ def load_pusht_slice_train_val(
         data_path=data_path + "/train",
         normalize_action=normalize_action,
         with_velocity=with_velocity,
+        dset_fraction=dset_fraction,
     )
     val_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -165,6 +180,7 @@ def load_pusht_slice_train_val(
         data_path=data_path + "/val",
         normalize_action=normalize_action,
         with_velocity=with_velocity,
+        dset_fraction=dset_fraction,
     )
 
     num_frames = num_hist + num_pred

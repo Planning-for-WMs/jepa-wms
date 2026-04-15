@@ -10,6 +10,8 @@ from einops import rearrange
 from torch import default_generator, randperm
 from torch.utils.data import Dataset
 
+from src.utils.logging import get_logger
+log = get_logger(__name__)
 
 # https://github.com/JaidedAI/EasyOCR/issues/1243
 def _accumulate(iterable, fn=lambda x, y: x + y):
@@ -100,7 +102,7 @@ class TrajSlicerDataset(TrajDataset):
         for i in range(len(self.dataset)):
             T = self.dataset.get_seq_length(i)
             if T - num_frames < 0:
-                print(f"Ignored short sequence #{i}: len={T}, num_frames={num_frames}")
+                log.info(f"Ignored short sequence #{i}: len={T}, num_frames={num_frames}")
             else:
                 self.slices += [
                     (i, start, start + num_frames * self.frameskip) for start in range(T - num_frames * frameskip + 1)
@@ -161,7 +163,7 @@ def random_split_traj(
     if sum(lengths) != len(dataset):  # type: ignore[arg-type]
         raise ValueError("Sum of input lengths does not equal the length of the input dataset!")
     indices = randperm(sum(lengths), generator=generator).tolist()
-    print([indices[offset - length : offset] for offset, length in zip(_accumulate(lengths), lengths)])
+    log.info([indices[offset - length : offset] for offset, length in zip(_accumulate(lengths), lengths)])
     if traj_subset:
         return [
             TrajSubset(dataset, indices[offset - length : offset])

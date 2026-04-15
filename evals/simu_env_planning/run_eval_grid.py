@@ -15,12 +15,14 @@ This script generates config files to run planning evals. It works by:
 3. Outputting configs to --out-dir (defaults to configs/cwtemp)
 
 Usage:
-    python -m evals.simu_env_planning.run_eval_grid --env droid --variant H3
+    python -m evals.simu_env_planning.run_eval_grid --env droid --variant H3 --alpha 0
     python -m evals.simu_env_planning.run_eval_grid --env metaworld
     python -m evals.simu_env_planning.run_eval_grid --env robocasa --variant reach place
     python -m evals.simu_env_planning.run_eval_grid --env maze
     python -m evals.simu_env_planning.run_eval_grid --env pusht
     python -m evals.simu_env_planning.run_eval_grid --env wall
+
+    --config path/to/cfg/to_override
 """
 
 import argparse
@@ -281,7 +283,7 @@ def main():
     print(
         f"python -m evals.main_distributed --fname {batch_path} --batch-launch "
         f"--array-parallelism 700 --account fair_amaia_cw_video --qos lowest --time 120 "
-        f"--submitit_folder {sample_conf['folder']}/submitit-evals-batches/ --use_config_folder --copy_code"
+        f"--submitit_folder {sample_conf['folder']}/submitit-evals-batches/ --copy_code"
     )
 
 

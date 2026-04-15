@@ -364,8 +364,8 @@ def main(args, resume_preempt=False):
         data_kwargs_1 = data_kwargs.copy()
         data_kwargs_1.update(
             {
-                "droid_fraction": 1,
-                "val_droid_fraction": 1,
+                "dset_fraction": 1,
+                "val_dset_fraction": 1,
                 "data_paths": val_datasets_1_paths,
                 "val_data_paths": val_datasets_1_paths,
                 "batch_size": val_datasets_1.get("batch_size", 4),

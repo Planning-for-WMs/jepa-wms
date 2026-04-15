@@ -70,6 +70,7 @@ class MetaworldHFDataset(TrajDataset):
         action_scale=1.0,
         filter_tasks: Optional[List[str]] = None,
         with_reward: bool = True,
+        dset_fraction: float = 1.0,
     ):
         self.data_path = Path(data_path)
         self.transform = transform
@@ -89,6 +90,11 @@ class MetaworldHFDataset(TrajDataset):
         if n_rollout is not None:
             ds = ds.select(range(min(n_rollout, len(ds))))
 
+        if dset_fraction < 1.0:
+            original_len = len(ds)
+            num_samples = max(1, int(original_len * dset_fraction))
+            ds = ds.select(range(num_samples))
+            log.info(f"Slicing Metaworld dataset from {original_len} to {num_samples} samples ({dset_fraction*100:.1f}%)")
         self.dataset = ds
         log.info(f"✅ Loaded {len(ds)} Metaworld rollouts")
 
@@ -217,6 +223,7 @@ def load_metaworld_hf_slice_train_val(
     random_seed=42,
     with_reward=False,
     process_actions="concat",
+    dset_fraction: float = 1.0,
 ):
     dset = MetaworldHFDataset(
         n_rollout=n_rollout,
@@ -225,6 +232,7 @@ def load_metaworld_hf_slice_train_val(
         normalize_action=normalize_action,
         filter_tasks=filter_tasks,
         with_reward=with_reward,
+        dset_fraction=dset_fraction,
     )
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
         traj_dataset=dset,

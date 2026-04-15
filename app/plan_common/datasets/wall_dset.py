@@ -28,6 +28,7 @@ class WallDataset(TrajDataset):
         transform: Optional[Callable] = None,
         normalize_action: bool = False,
         action_scale=1.0,
+        dset_fraction: float = 1.0,
     ):
         self.data_path = Path(data_path)
         self.transform = transform
@@ -53,6 +54,15 @@ class WallDataset(TrajDataset):
         self.proprios = self.proprios[:n]
         self.door_locations = self.door_locations[:n]
         self.wall_locations = self.wall_locations[:n]
+        if dset_fraction < 1.0:
+            num_keep = max(1, int(n * dset_fraction))
+            self.states = self.states[:num_keep]
+            self.actions = self.actions[:num_keep]
+            self.proprios = self.proprios[:num_keep]
+            self.door_locations = self.door_locations[:num_keep]
+            self.wall_locations = self.wall_locations[:num_keep]
+            log.info(f"Slicing Wall dataset from {n} to {num_keep} samples ({dset_fraction*100:.1f}%)")
+            n = num_keep
 
         self.action_dim = self.actions.shape[-1]
         self.state_dim = self.states.shape[-1]
@@ -123,6 +133,7 @@ def load_wall_slice_train_val(
     traj_subset=True,
     random_seed=42,
     process_actions="concat",
+    dset_fraction: float = 1.0,
 ):
     if split_mode == "random":
         dset = WallDataset(
@@ -130,6 +141,7 @@ def load_wall_slice_train_val(
             transform=transform,
             data_path=data_path,
             normalize_action=normalize_action,
+            dset_fraction=dset_fraction,
         )
         dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
             traj_dataset=dset,
@@ -148,12 +160,14 @@ def load_wall_slice_train_val(
             transform=transform,
             data_path=data_path + "/train",
             normalize_action=normalize_action,
+            dset_fraction=dset_fraction,
         )
         dset_val = WallDataset(
             n_rollout=n_rollout,
             transform=transform,
             data_path=data_path + "/val",
             normalize_action=normalize_action,
+            dset_fraction=dset_fraction,
         )
         num_frames = num_hist + num_pred
         train_slices = TrajSlicerDataset(

@@ -116,6 +116,7 @@ class RoboCasaDataset(TrajDataset):
         output_rcasa_info=False,
         rcasa_to_droid_action_format=False,
         custom_teleop_dset=False,
+        dset_fraction: float = 1.0,
     ):
         self.transform = transform
         self.data_path = data_path
@@ -246,6 +247,12 @@ class RoboCasaDataset(TrajDataset):
                 raise ValueError(f"No hdf5 files found for any of the specified tasks: {self.filter_tasks}")
 
         logger.info(f"Total dataset: {len(self.file_paths)} files across {len(self.filter_tasks)} tasks")
+
+        if dset_fraction < 1.0:
+            original_len = len(self.file_paths)
+            num_keep = max(1, int(original_len * dset_fraction))
+            self.file_paths = self.file_paths[:num_keep]
+            logger.info(f"Slicing RoboCasa dataset from {original_len} to {num_keep} files ({dset_fraction*100:.1f}%)")
 
         # Load data from all files
         for file_path in self.file_paths:
@@ -508,6 +515,7 @@ def load_robocasa_slice_train_val(
     rcasa_to_droid_action_format=False,
     process_actions="concat",
     custom_teleop_dset=False,
+    dset_fraction: float = 1.0,
 ):
     """
     Load RoboCasa dataset and split into train and validation sets.
@@ -549,6 +557,7 @@ def load_robocasa_slice_train_val(
         output_rcasa_info=output_rcasa_info,
         rcasa_to_droid_action_format=rcasa_to_droid_action_format,
         custom_teleop_dset=custom_teleop_dset,
+        dset_fraction=dset_fraction,
     )
 
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(

@@ -2,7 +2,7 @@ app: vjepa_wm
 nodes: 2
 tasks_per_node: 8
 cpus_per_task: 16
-folder: ${JEPAWM_LOGS}/wall_sweep/wall_4f_fsk5_ask1_r224_pred_dino_wm_depth6_noprop_repro_1roll_save_2n
+folder: ${JEPAWM_LOGS}/wall_sweep/wall_4f_fsk5_ask1_r224_pred_dino_wm_depth6_noprop_repro_1roll_hist9
 data:
   # Dataset configuration
   dataset_type: custom
@@ -37,7 +37,7 @@ data:
     traj_subset: true
     filter_first_episodes: null
     filter_tasks: null
-    num_hist: 3
+    num_hist: 9
     num_pred: 1
     with_reward: false
     custom_teleop_dset: null
@@ -106,7 +106,7 @@ model:
   use_activation_checkpointing: false
   action_conditioning: feature
   proprio_encoding: feature
-  num_frames_pred: 4
+  num_frames_pred: 10
   # Visual encoder config
   visual_encoder:
     enc_type: dino
@@ -197,6 +197,7 @@ evals:
   low_pri: true
   obs: rgb
   alpha: 0
+  dump_eval_configs: false
   eval_cfg_paths:
   - configs/online_plan_evals/wall/adam/wall_L2_adam_sourcerandstate_H6_nas6_ctxt2.yaml
   - configs/online_plan_evals/wall/gd/wall_L2_gd_sourcerandstate_H6_nas6_ctxt2.yaml

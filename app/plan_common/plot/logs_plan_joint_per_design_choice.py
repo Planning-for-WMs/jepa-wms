@@ -30,6 +30,52 @@ from src.utils.yaml_utils import expand_env_vars
 JEPAWM_LOGS = os.environ.get("JEPAWM_LOGS", "~")
 base_dir = "app/plan_common/local/plan_joint_per_design_choice"
 
+
+def is_multi_method_yaml(design_choices: dict) -> bool:
+    """Check if the YAML contains multi-method entries (ordinal -> [{method: [paths]}])."""
+    for key, value in design_choices.items():
+        if key == "design_choice_name":
+            continue
+        if isinstance(value, list) and len(value) > 0:
+            if isinstance(value[0], dict):
+                return True
+    return False
+
+
+def flatten_multi_method_yaml(design_choices: dict) -> tuple:
+    """Flatten a multi-method YAML into single-method format plus a reverse mapping.
+
+    Args:
+        design_choices: Dict where ordinal keys map to lists of
+            single-key dicts [{method: [paths]}, ...].
+
+    Returns:
+        Tuple of (flat_design_choices, model_to_method) where:
+        - flat_design_choices: {ordinal: [all_paths_across_methods]}
+        - model_to_method: {model_path: method_name}
+    """
+    flat_design_choices = {}
+    model_to_method = {}
+    for key, value in design_choices.items():
+        if key == "design_choice_name":
+            flat_design_choices[key] = value
+            continue
+        if isinstance(value, list):
+            all_paths = []
+            for item in value:
+                if isinstance(item, dict):
+                    for method_name, paths in item.items():
+                        if isinstance(paths, list):
+                            all_paths.extend(paths)
+                            for p in paths:
+                                model_to_method[p] = method_name
+                elif isinstance(item, str):
+                    all_paths.append(item)
+            flat_design_choices[key] = all_paths
+        else:
+            flat_design_choices[key] = value
+    return flat_design_choices, model_to_method
+
 task_groups_mapping = {
     "droid": "DROID",
     "pt": "Push-T",
@@ -710,6 +756,143 @@ def aggregate_task_data_by_groups(
     return results
 
 
+def aggregate_task_data_by_groups_multi_method(
+    task_eval_data,
+    design_choices,
+    task_groups_mapping,
+    model_to_method,
+    last_n_epochs={},
+    start_from_epoch={},
+    use_computed_best_eval_setup=False,
+    std_average_group=False,
+):
+    """Aggregate task data with an additional method dimension.
+
+    Args:
+        task_eval_data: Data collected using collect_task_eval_data function.
+        design_choices: Dict mapping ordinal labels to lists of model paths (flattened).
+        task_groups_mapping: Dict mapping task names to display names.
+        model_to_method: Dict mapping model paths to method names.
+        last_n_epochs: Dict mapping task names to number of last epochs to aggregate over.
+        start_from_epoch: Dict mapping task names to starting epoch index.
+        use_computed_best_eval_setup: Whether to pick the best eval setup per task group.
+        std_average_group: Whether to propagate std for the Avg group.
+
+    Returns:
+        dict: {task_group: {method: {design_choice: (mean, std, count)}}}
+    """
+    model_to_design = {}
+    for design, model_paths in design_choices.items():
+        if design == "design_choice_name":
+            continue
+        for path in model_paths:
+            model_to_design[path] = design
+
+    eval_setup_data = defaultdict(list)
+
+    for (model_path, task_name, eval_setup, seed), df in task_eval_data.items():
+        if task_name not in task_groups_mapping:
+            continue
+
+        if model_path not in model_to_design:
+            parent_path = os.path.dirname(model_path)
+            if parent_path in model_to_design:
+                model_to_design[model_path] = model_to_design[parent_path]
+                if parent_path in model_to_method:
+                    model_to_method[model_path] = model_to_method[parent_path]
+
+        design_choice = model_to_design.get(model_path)
+        method = model_to_method.get(model_path)
+        if design_choice is None or method is None:
+            continue
+
+        task_group = task_groups_mapping[task_name]
+        key = (task_group, method, design_choice, eval_setup)
+
+        if task_name == "droid":
+            if "Act_err_xyz" in df.columns and not df["Act_err_xyz"].isnull().any():
+                metric_values = np.maximum(0, 800 * (0.1 - df["Act_err_xyz"]))
+            else:
+                continue
+        else:
+            metric_values = df["SR"]
+
+        epochs = df["epoch"].values
+        if task_name in start_from_epoch:
+            mask = epochs >= start_from_epoch[task_name]
+            filtered_metric_values = metric_values[mask]
+        else:
+            filtered_metric_values = metric_values
+
+        task_specific_last_n = last_n_epochs.get(task_name, 10)
+        if len(filtered_metric_values) >= task_specific_last_n:
+            last_n_values = filtered_metric_values.iloc[-task_specific_last_n:].values
+        else:
+            last_n_values = (
+                filtered_metric_values.values if hasattr(filtered_metric_values, "values") else filtered_metric_values
+            )
+
+        eval_setup_data[key].extend(last_n_values)
+
+    # Pick best eval setup per (task_group, method, design_choice)
+    best_results = {}
+    for (task_group, method, design_choice, eval_setup), values in eval_setup_data.items():
+        values = np.array(values)
+        mean_perf = np.mean(values) if len(values) > 0 else 0
+        std_perf = np.std(values) if len(values) > 0 else 0
+        n_samples = len(values)
+
+        if use_computed_best_eval_setup:
+            rkey = (task_group, method, design_choice)
+            if rkey not in best_results or mean_perf > best_results[rkey][0]:
+                best_results[rkey] = (mean_perf, std_perf, n_samples)
+        else:
+            if eval_setup != best_eval_setup_per_task_group.get(task_group):
+                continue
+            best_results[(task_group, method, design_choice)] = (mean_perf, std_perf, n_samples)
+
+    # Structure: {task_group: {method: {design_choice: (mean, std, count)}}}
+    results = {}
+    for (task_group, method, design_choice), (mean, std, count) in best_results.items():
+        results.setdefault(task_group, {}).setdefault(method, {})[design_choice] = (mean, std, count)
+
+    # Compute Avg across task groups for each (method, design_choice)
+    all_methods = set()
+    all_designs = set()
+    for tg_data in results.values():
+        for method, dc_data in tg_data.items():
+            all_methods.add(method)
+            all_designs.update(dc_data.keys())
+
+    task_groups_list = [tg for tg in results if tg != "Avg"]
+    avg_data = {}
+    for method in all_methods:
+        avg_data[method] = {}
+        for design in all_designs:
+            values = []
+            for task_group in task_groups_list:
+                if method in results.get(task_group, {}) and design in results[task_group][method]:
+                    mean, _, count = results[task_group][method][design]
+                    if count > 0:
+                        values.append(mean)
+            if values:
+                mean_value = np.mean(values)
+                if std_average_group:
+                    combined_variance = sum(
+                        results[tg][method][design][1] ** 2
+                        for tg in task_groups_list
+                        if method in results.get(tg, {}) and design in results[tg][method]
+                    )
+                    std_value = np.sqrt(combined_variance)
+                else:
+                    std_value = 0
+                avg_data[method][design] = (mean_value, std_value, sum(1 for _ in values))
+
+    results["Avg"] = avg_data
+    print(f"Multi-method aggregated results: {list(results.keys())} task groups, methods: {list(all_methods)}")
+    return results
+
+
 def aggregate_task_data_by_eval_setup(
     task_eval_data,
     eval_setup_aliases,
@@ -1006,6 +1189,8 @@ def plot_design_choices_line(
     std_average_group=False,
     offset_markers=True,
     highlight_task_groups=None,
+    avg_design_choices=None,
+    color_offset=0,
 ):
     """
     Create a line plot showing performance trends across ordered design choices.
@@ -1057,7 +1242,8 @@ def plot_design_choices_line(
     fig, ax = plt.subplots(figsize=figsize)
 
     # Set up colors
-    colors = sns.color_palette(color_palette, len(task_groups) + 1)  # +1 for Average
+    colors = sns.color_palette(color_palette, len(task_groups) + 1 + color_offset)  # +1 for Average
+    colors = colors[color_offset:]
     markers = ["o", "s", "^", "v", "D", "P", "X", "*", "h", "p", "<", ">", "8"]
 
     # Create x-axis positions for the design choices
@@ -1117,22 +1303,27 @@ def plot_design_choices_line(
             )
 
     if "Avg" in aggregated_data:
-        means = []
-        stds = []
+        avg_means = []
+        avg_stds = []
+        avg_x = []
 
-        for design in design_names:
+        for xi, design in enumerate(design_names):
+            if avg_design_choices is not None and design not in avg_design_choices:
+                continue
             if design in aggregated_data["Avg"]:
                 mean, std, _ = aggregated_data["Avg"][design]
-                means.append(mean)
-                stds.append(std)
+                avg_means.append(mean)
+                avg_stds.append(std)
+                avg_x.append(x_pos[xi])
             else:
-                means.append(0)
-                stds.append(0)
+                avg_means.append(0)
+                avg_stds.append(0)
+                avg_x.append(x_pos[xi])
 
         ax.errorbar(
-            x_pos,
-            means,
-            yerr=stds,
+            avg_x,
+            avg_means,
+            yerr=avg_stds,
             fmt="o-" if connect_means else "o",
             capsize=3,
             label="Avg",
@@ -1152,6 +1343,242 @@ def plot_design_choices_line(
 
     ax.legend(fontsize=9, loc="center left", bbox_to_anchor=(1, 0.5))
 
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        print(f"Figure saved to: {save_path}")
+
+    return fig
+
+
+def plot_design_choices_line_multi_method(
+    task_eval_data,
+    design_choices,
+    task_groups_mapping,
+    model_to_method,
+    last_n_epochs=10,
+    start_from_epoch={},
+    figsize=(6, 4),
+    dpi=300,
+    save_path=None,
+    use_computed_best_eval_setup=False,
+    std_average_group=False,
+    highlight_task_groups=None,
+    offset_markers=True,
+    skip_avg_methods=None,
+    avg_design_choices=None,
+    color_offset=0,
+):
+    """Line plot with color=dataset, marker=method for multi-method YAML files.
+
+    Args:
+        task_eval_data: Data collected using collect_task_eval_data function.
+        design_choices: Flattened dict mapping ordinal labels to lists of model paths.
+        task_groups_mapping: Dict mapping task names to display names.
+        model_to_method: Dict mapping model paths to method names.
+        last_n_epochs: Dict, key=task_group: value=Number of last epochs to aggregate.
+        start_from_epoch: Dict mapping task names to starting epoch index.
+        figsize: Figure size.
+        dpi: DPI for saved figure.
+        save_path: Optional path to save the figure.
+        use_computed_best_eval_setup: Whether to pick the best eval setup per task group.
+        std_average_group: Whether to propagate std for the Avg group.
+        highlight_task_groups: List of task group names to highlight with full lines.
+        offset_markers: Whether to apply small horizontal offsets to markers
+            so that overlapping points at the same x-coordinate are easier to
+            distinguish.
+        skip_avg_methods: Optional list of method names to exclude from the
+            Avg mean marker and line.
+
+    Returns:
+        matplotlib.figure.Figure: The created figure.
+    """
+    sns.set_theme()
+
+    if "design_choice_name" in design_choices:
+        design_choice_name = design_choices.pop("design_choice_name")
+        design_names = [k for k in design_choices.keys() if k != "design_choice_name"]
+    else:
+        design_names = list(design_choices.keys())
+        design_choice_name = ""
+
+    aggregated_data = aggregate_task_data_by_groups_multi_method(
+        task_eval_data,
+        design_choices,
+        task_groups_mapping,
+        model_to_method,
+        last_n_epochs,
+        start_from_epoch=start_from_epoch,
+        use_computed_best_eval_setup=use_computed_best_eval_setup,
+        std_average_group=std_average_group,
+    )
+
+    task_groups = [g for g in aggregated_data.keys() if g != "Avg"]
+
+    all_methods = set()
+    for tg_data in aggregated_data.values():
+        all_methods.update(tg_data.keys())
+    method_names = sorted(all_methods)
+
+    METHOD_MARKERS = {"Ours": "o", "DWM": "s", "VJ2AC": "^"}
+    fallback_markers = ["o", "s", "^", "v", "D", "P", "X", "*", "h", "p"]
+    for i, m in enumerate(method_names):
+        if m not in METHOD_MARKERS:
+            METHOD_MARKERS[m] = fallback_markers[i % len(fallback_markers)]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    x_pos = np.arange(len(design_names))
+
+    # Calculate horizontal offsets to distribute markers by method.
+    # All markers for the 1st method go on the left offset,
+    # 2nd method on center (offset zero), 3rd method on the right offset.
+    if offset_markers:
+        n_methods = len(method_names)
+        if n_methods == 1:
+            method_to_offset = {method_names[0]: 0.0}
+        else:
+            offsets_list = np.linspace(-0.1, 0.1, n_methods)
+            method_to_offset = {m: offsets_list[i] for i, m in enumerate(method_names)}
+    else:
+        method_to_offset = {m: 0.0 for m in method_names}
+
+    colors = sns.color_palette("tab10", len(task_groups) + color_offset)
+    colors = colors[color_offset:]
+    task_group_colors = {tg: colors[i] for i, tg in enumerate(task_groups)}
+
+    for tg_idx, task_group in enumerate(task_groups):
+        tg_methods = aggregated_data.get(task_group, {})
+        color = task_group_colors[task_group]
+
+        for method in method_names:
+            if method not in tg_methods:
+                continue
+            dc_data = tg_methods[method]
+            means = []
+            stds = []
+            valid_x = []
+
+            for xi, design in enumerate(design_names):
+                if avg_design_choices is not None and design not in avg_design_choices:
+                    continue
+                if design in dc_data:
+                    mean, std, count = dc_data[design]
+                    if count > 0:
+                        means.append(mean)
+                        stds.append(std)
+                        valid_x.append(x_pos[xi])
+                    else:
+                        means.append(np.nan)
+                        stds.append(np.nan)
+                        valid_x.append(x_pos[xi])
+                else:
+                    means.append(np.nan)
+                    stds.append(np.nan)
+                    valid_x.append(x_pos[xi])
+
+            means = np.array(means)
+            stds = np.array(stds)
+            valid_x = np.array(valid_x)
+            mask = ~np.isnan(means)
+
+            if not mask.any():
+                continue
+
+            marker = METHOD_MARKERS.get(method, "o")
+            is_highlighted = highlight_task_groups and task_group in highlight_task_groups
+            label = f"{method} / {task_group}"
+            x_offset = method_to_offset[method]
+
+            if is_highlighted:
+                ax.errorbar(
+                    valid_x[mask] + x_offset,
+                    means[mask],
+                    yerr=stds[mask],
+                    fmt=f"{marker}-",
+                    capsize=3,
+                    label=label,
+                    color=color,
+                    linewidth=1.5,
+                    markersize=7,
+                    alpha=0.8,
+                )
+            else:
+                ax.errorbar(
+                    valid_x[mask] + x_offset,
+                    means[mask],
+                    yerr=stds[mask],
+                    fmt=marker,
+                    capsize=3,
+                    label=label,
+                    color=color,
+                    alpha=0.4,
+                )
+
+    # Avg lines per method
+    if "Avg" in aggregated_data:
+        avg_methods = aggregated_data["Avg"]
+        for method in method_names:
+            if skip_avg_methods and method in skip_avg_methods:
+                continue
+            if method not in avg_methods:
+                continue
+            dc_data = avg_methods[method]
+            means = []
+            stds = []
+            valid_x = []
+            for xi, design in enumerate(design_names):
+                if design in dc_data:
+                    mean, std, count = dc_data[design]
+                    if count > 0:
+                        means.append(mean)
+                        stds.append(std)
+                        valid_x.append(x_pos[xi])
+
+            if not means:
+                continue
+
+            marker = METHOD_MARKERS.get(method, "o")
+            x_offset = method_to_offset.get(method, 0.0)
+            ax.errorbar(
+                np.array(valid_x) + x_offset,
+                means,
+                yerr=stds,
+                fmt=f"{marker}--",
+                capsize=3,
+                label=f"Avg ({method})",
+                color="black",
+                linewidth=2.0,
+                markersize=8,
+                alpha=0.6,
+            )
+
+    ax.set_ylabel("Performance (%)", fontsize=10)
+    ax.set_xlabel(design_choice_name, fontsize=10)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([str(d) for d in design_names], fontsize=9)
+    ax.set_ylim(0, 100)
+    ax.grid(axis="y", linestyle="--", alpha=0.7)
+
+    # Two-part legend: color patches for datasets, marker symbols for methods
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    legend_handles = []
+    # legend_handles.append(Patch(facecolor="white", edgecolor="white", label="Datasets:"))
+    legend_handles.append(Line2D([], [], linestyle="None", label="Datasets:"))
+    for tg in task_groups:
+        legend_handles.append(Patch(facecolor=task_group_colors[tg], label=tg, alpha=0.7))
+    legend_handles.append(Line2D([], [], linestyle="None", label=""))
+    # legend_handles.append(Patch(facecolor="white", edgecolor="white", label="Methods:"))
+    legend_handles.append(Line2D([], [], linestyle="None", label="Methods:"))
+    for method in method_names:
+        marker = METHOD_MARKERS.get(method, "o")
+        legend_handles.append(
+            Line2D([0], [0], marker=marker, color="gray", linestyle="None", markersize=7, label=method)
+        )
+
+    ax.legend(handles=legend_handles, fontsize=8, loc="center left", bbox_to_anchor=(1, 0.5))
     plt.tight_layout()
 
     if save_path:
@@ -1538,6 +1965,11 @@ def main():
         python app/plan_common/plot/logs_plan_joint_per_design_choice.py --design_choices_file app/plan_common/plot/design_choice_yamls/prop.yaml --output prop_comparison --verbose --exclude_robocasa
         python app/plan_common/plot/logs_plan_joint_per_design_choice.py --design_choices_file app/plan_common/plot/design_choice_yamls/final_baseline_comp.yaml --output final_baseline_comp --generate_latex --verbose
 
+        python app/plan_common/plot/logs_plan_joint_per_design_choice.py --design_choices_file app/plan_common/plot/design_choice_yamls/data_scaling.yaml --output data_scaling_comparison --plot_line --verbose --skip_avg_methods "Ours,DWM,VJ2AC" --highlight_task_groups "Push-T","Wall","Maze","MW-\nReach","MW-\nReach-\nWall"
+        python app/plan_common/plot/logs_plan_joint_per_design_choice.py --design_choices_file app/plan_common/plot/design_choice_yamls/data_scaling_droid_rcasa.yaml --output data_scaling_droid_rcasa_comparison --plot_line --verbose --skip_avg_methods "Ours,DWM,VJ2AC" --highlight_task_groups "DROID","Rc-R","Rc-Pl" --color_offset 5
+
+        python app/plan_common/plot/logs_plan_joint_per_design_choice.py --design_choices_file app/plan_common/plot/design_choice_yamls/W_extended.yaml --output W_extended_comparison --plot_line --verbose --highlight_task_groups "DROID" --avg_design_choices "W=1,W=2,W=3,W=5,W=7,W=9"
+
         Test:
         python app/plan_common/plot/logs_plan_joint_per_design_choice.py --design_choices_file app/plan_common/plot/design_choice_yamls/test_n_epochs.yaml --output test_n_epochs --generate_latex --verbose
         python app/plan_common/plot/logs_plan_joint_per_design_choice.py --design_choices_file app/plan_common/plot/design_choice_yamls/test_n_epochs.yaml --output test_n_epochs --generate_latex --verbose --cut_eval_setup ep
@@ -1613,9 +2045,27 @@ def main():
         help='Comma-separated list of task group names to highlight with full lines in line plots. Example: "DROID"',
     )
     parser.add_argument(
+        "--skip_avg_methods",
+        type=str,
+        default=None,
+        help='Comma-separated list of method names to exclude from the Avg line. Example: "VJ2AC"',
+    )
+    parser.add_argument(
+        "--avg_design_choices",
+        type=str,
+        default=None,
+        help='Comma-separated list of design choice names to include in the Avg line/markers. Example: "W=1,W=2,W=3,W=5,W=7,W=9"',
+    )
+    parser.add_argument(
         "--exclude_robocasa",
         action="store_true",
         help="Exclude robocasa tasks (Rc-R, Rc-P, Rc-Pl, Rc-RP, Rc-PP, Rc-RPP) from the analysis",
+    )
+    parser.add_argument(
+        "--color_offset",
+        type=int,
+        default=0,
+        help="Offset into the color palette to avoid color collisions between separate plots",
     )
     args = parser.parse_args()
 
@@ -1640,6 +2090,16 @@ def main():
         design_choices = yaml.load(f)
     design_choices = expand_env_vars(design_choices)
 
+    # Detect multi-method YAML format and flatten if needed
+    is_multi_method = is_multi_method_yaml(design_choices)
+    model_to_method_map = {}
+    if is_multi_method:
+        flat_design_choices, model_to_method_map = flatten_multi_method_yaml(design_choices)
+        if args.verbose:
+            print(f"Detected multi-method YAML with methods: {set(model_to_method_map.values())}")
+    else:
+        flat_design_choices = design_choices
+
     save_file = Path(f"{base_dir}/{args.output}.pdf")
     os.makedirs(os.path.dirname(save_file), exist_ok=True)
 
@@ -1656,15 +2116,15 @@ def main():
     model_paths = []
     # Check if design_choices has a design_choice_name key
     design_choice_name = None
-    if "design_choice_name" in design_choices:
-        design_choice_name = design_choices.get("design_choice_name")
+    if "design_choice_name" in flat_design_choices:
+        design_choice_name = flat_design_choices.get("design_choice_name")
         # Only iterate through the actual design choices (not the name)
-        for key, paths in design_choices.items():
+        for key, paths in flat_design_choices.items():
             if key != "design_choice_name":
                 model_paths.extend(paths)
     else:
         # Original behavior if no design_choice_name is present
-        for paths in design_choices.values():
+        for paths in flat_design_choices.values():
             model_paths.extend(paths)
 
     if args.verbose:
@@ -1710,22 +2170,58 @@ def main():
             # Parse highlight_task_groups if provided
             highlight_groups = None
             if args.highlight_task_groups:
-                highlight_groups = [g.strip() for g in args.highlight_task_groups.split(",")]
+                highlight_groups = [
+                    g.strip().encode().decode("unicode_escape")
+                    for g in args.highlight_task_groups.split(",")
+                ]
 
-            fig = plot_design_choices_line(
-                task_eval_data,
-                design_choices,
-                task_groups_mapping,
-                last_n_epochs=effective_last_n_epochs,
-                start_from_epoch=effective_start_from_epoch,
-                figsize=figsize,
-                save_path=save_file,
-                dpi=args.dpi,
-                connect_means=True,
-                use_computed_best_eval_setup=args.use_computed_best_eval_setup,
-                std_average_group=args.std_average_group,
-                highlight_task_groups=highlight_groups,
-            )
+            if is_multi_method:
+                fig = plot_design_choices_line_multi_method(
+                    task_eval_data,
+                    flat_design_choices,
+                    task_groups_mapping,
+                    model_to_method_map,
+                    last_n_epochs=effective_last_n_epochs,
+                    start_from_epoch=effective_start_from_epoch,
+                    figsize=figsize,
+                    save_path=save_file,
+                    dpi=args.dpi,
+                    use_computed_best_eval_setup=args.use_computed_best_eval_setup,
+                    std_average_group=args.std_average_group,
+                    highlight_task_groups=highlight_groups,
+                    skip_avg_methods=(
+                        [m.strip() for m in args.skip_avg_methods.split(",")]
+                        if args.skip_avg_methods
+                        else None
+                    ),
+                    avg_design_choices=(
+                        [c.strip() for c in args.avg_design_choices.split(",")]
+                        if args.avg_design_choices
+                        else None
+                    ),
+                    color_offset=args.color_offset,
+                )
+            else:
+                fig = plot_design_choices_line(
+                    task_eval_data,
+                    design_choices,
+                    task_groups_mapping,
+                    last_n_epochs=effective_last_n_epochs,
+                    start_from_epoch=effective_start_from_epoch,
+                    figsize=figsize,
+                    save_path=save_file,
+                    dpi=args.dpi,
+                    connect_means=True,
+                    use_computed_best_eval_setup=args.use_computed_best_eval_setup,
+                    std_average_group=args.std_average_group,
+                    highlight_task_groups=highlight_groups,
+                    avg_design_choices=(
+                        [c.strip() for c in args.avg_design_choices.split(",")]
+                        if args.avg_design_choices
+                        else None
+                    ),
+                    color_offset=args.color_offset,
+                )
         elif args.generate_latex_all:
             # Parse planners_to_include if provided
             planners_list = None
