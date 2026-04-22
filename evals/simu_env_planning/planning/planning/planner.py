@@ -12,6 +12,7 @@ import nevergrad as ng
 import numpy as np
 import torch
 import torch.distributed as dist
+from tensordict import TensorDict
 
 from evals.simu_env_planning.planning.planning import objectives
 from src.utils.logging import get_logger
@@ -344,287 +345,54 @@ class CEMPlanner(Planner):
         return result
 
 class GRASPlanner(Planner):
-    """GRASP: Gradient RelAxed Stochastic Planner.
-
-    Implements the planner from "Parallel Stochastic Gradient-Based Planning for
-    World Models" (Psenka et al., 2025). Core components:
-
-    1. **Parallelized planning with virtual states**: Introduces auxiliary "virtual
-       states" z_1,...,z_T as optimization variables alongside actions a_0,...,a_{T-1}.
-       All one-step world model evaluations F(z_t, a_t) are computed in parallel.
-
-    2. **Langevin state noise**: Injects isotropic Gaussian noise into state iterates
-       each optimization step, allowing escape from local minima (Eq. 5 in paper).
-
-    3. **Grad-cut dynamics loss with dense goal shaping**: Detaches gradients through
-       state inputs of the world model (stop-gradient on z_t when computing F(z_t, a_t))
-       to avoid adversarial exploitation of brittle state Jacobians. Adds a dense goal
-       loss on one-step predictions to provide task-aligned signal at every timestep
-       (Eqs. 8-10 in paper).
-
-    4. **Full-rollout synchronization**: Periodically runs standard gradient descent
-       on the serial rollout objective for refinement (Eqs. 13-15 in paper).
-
-    Unlike other planners that only need the `unroll` callable, GRASP requires direct
-    access to the EncPredWM model for parallel one-step predictions via `forward_pred`
-    and action encoding via `encode_act`.
-    """
-
     def __init__(
         self,
         unroll: Callable,
         action_dim: int,
         horizon: int = 32,
-        # GRASP optimization parameters
-        steps: int = 100,
-        action_lr: float = 0.01,
+        iterations: int = 100,
         state_lr: float = 0.01,
-        state_noise_std: float = 0.01,
+        action_lr: float = 0.01,
         gamma: float = 1.0,
-        # Full-rollout sync parameters
-        sync_every: int = 20,
-        sync_steps: int = 5,
+        K_sync: int = 10,
+        J_sync: int = 1,
         sync_lr: float = 0.01,
-        # Initialization
+        state_sigma: float = 0.01,
+        epsilon: float = 0.01,
         var_scale: float = 1.0,
-        action_init: str = "zero",
-        state_init: str = "rollout",
-        # Action clipping
         max_norms: List[float] = None,
         max_norm_dims: List[List[int]] = [[0, 1, 2], [6]],
-        # Output
         num_act_stepped: int = None,
         decode_each_iteration: bool = False,
         decode_unroll: Callable = None,
-        # World model access
-        enc_pred_wm=None,
+        enc_pred_wm: torch.nn.Module = None,
         **kwargs,
     ):
-        """
-        Args:
-            unroll: Serial rollout function (from EncPredWM).
-            action_dim: Dimension of the action space.
-            horizon: Planning horizon T (number of action steps).
-            steps: Total number of GRASP optimization iterations.
-            action_lr: Learning rate for action gradient updates.
-            state_lr: Learning rate for state gradient updates.
-            state_noise_std: Std of Langevin noise injected into virtual states (σ).
-            gamma: Weight for dense goal shaping loss relative to dynamics loss.
-            sync_every: Run full-rollout sync every K_sync iterations.
-            sync_steps: Number of GD steps per sync phase (J_sync).
-            sync_lr: Learning rate for sync-phase gradient descent.
-            var_scale: Scale for random initialization of actions.
-            action_init: How to initialize actions ("zero" or "randn").
-            state_init: How to initialize virtual states ("zero", "randn", or "rollout").
-            max_norms: List of max norm values for action clipping per dim group.
-            max_norm_dims: List of dimension groups to clip.
-            num_act_stepped: Number of actions to return (execute).
-            decode_each_iteration: Whether to decode predictions at each iteration.
-            decode_unroll: Function to decode latent predictions to frames.
-            enc_pred_wm: The full EncPredWM model for direct access to forward_pred.
-        """
         super().__init__(unroll)
         self.action_dim = action_dim
         self.horizon = horizon
-        self.device = torch.device("cuda")
-        # GRASP-specific
-        self.steps = steps
-        self.action_lr = action_lr
+        self.iterations = iterations
         self.state_lr = state_lr
-        self.state_noise_std = state_noise_std
+        self.action_lr = action_lr
         self.gamma = gamma
-        # Sync
-        self.sync_every = sync_every
-        self.sync_steps = sync_steps
+        self.K_sync = K_sync
+        self.J_sync = J_sync
         self.sync_lr = sync_lr
-        # Init
+        self.state_sigma = state_sigma
+        self.epsilon = epsilon
         self.var_scale = var_scale
-        self.action_init = action_init
-        self.state_init = state_init
-        # Clipping
         self.max_norms = max_norms
         self.max_norm_dims = max_norm_dims
-        # Output
         self.num_act_stepped = num_act_stepped
         self.decode_each_iteration = decode_each_iteration
         self.decode_unroll = decode_unroll
-        # World model
         self.enc_pred_wm = enc_pred_wm
-        assert self.enc_pred_wm is not None, "GRASPlanner requires direct access to enc_pred_wm"
-        
-        # FREEZE WORLD MODEL PARAMETERS to prevent CUDA OOM during planning!
-        for param in self.enc_pred_wm.model.parameters():
-            param.requires_grad_(False)
-        self.enc_pred_wm.model.eval()
-
-        self.objective = None
-        # Goal encoding (set via set_goal_enc before planning)
-        self.goal_enc = None
-
-    def set_goal_enc(self, goal_enc):
-        """Store the goal encoding for dense goal shaping loss.
-
-        Args:
-            goal_enc: Goal state encoding, same type/shape as z_ctxt from EncPredWM.encode().
-                For visual-only: Tensor [1, tau, V, H, W, D] (tau=1 typically).
-                For multimodal: TensorDict with "visual" and "proprio" keys.
-        """
-        self.goal_enc = goal_enc
+        self.device = torch.device("cuda")
 
     def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """Apply per-dimension-group clipping to actions.
-
-        Args:
-            actions: (T, A) or (1, T, A) action tensor.
-
-        Returns:
-        """
         if self.max_norms is not None:
             for dims, maxnorm in zip(self.max_norm_dims, self.max_norms):
-                actions[..., dims] = torch.clip(actions[..., dims], min=-maxnorm, max=maxnorm)
-        return actions
-
-    def _one_step_predict(self, state_t: torch.Tensor, action_raw_t: torch.Tensor, proprio_t: torch.Tensor = None):
-        """Perform a single one-step prediction through the world model.
-
-        Encodes the action, then calls forward_pred with ctxt_window=1 (single frame).
-
-        Args:
-            state_t: Virtual state at time t. Shape (B, 1, V, H, W, D).
-            action_raw_t: Raw action at time t. Shape (B, 1, A).
-            proprio_t: Proprioceptive state at time t. Shape (B, 1, P).
-
-        Returns:
-            pred_vid: Predicted next visual state (B, 1, V, H, W, D).
-            pred_prop: Predicted next proprio state or None.
-        """
-        wm = self.enc_pred_wm.model
-        # Encode the raw action
-        act_feats = wm.encode_act(action_raw_t)  # (B, 1, ...) encoded action features
-        # forward_pred expects: video (B, tau, V, H, W, D), action (B, T, ...), proprio (B, T, ...)
-        pred_vid, _, pred_prop = wm.forward_pred(
-            state_t,
-            act_feats,
-            proprio_t,
-        )
-        
-        if proprio_t is not None:
-            if getattr(self.enc_pred_wm, "proprio_mode", None) == "compute_new_pose":
-                from app.plan_common.datasets.droid_dset import compute_new_pose
-                pred_prop = compute_new_pose(proprio_t, action_raw_t)
-            elif getattr(self.enc_pred_wm, "proprio_mode", None) == "predict_proprio":
-                if pred_prop is not None:
-                    pred_prop = pred_prop[:, -1:]
-        return pred_vid, pred_prop
-
-    def _compute_grasp_loss(
-        self,
-        virtual_states: torch.Tensor,
-        virtual_proprios: torch.Tensor,
-        actions: torch.Tensor,
-        z_init_vid: torch.Tensor,
-        z_init_prop: torch.Tensor,
-        goal_vid: torch.Tensor,
-        goal_prop: torch.Tensor,
-        plan_length: int,
-    ):
-        """Compute the GRASP loss: grad-cut dynamics consistency + dense goal shaping.
-
-        Implements Eq. 10 from the paper:
-            L(s, a) = Σ_t ‖z_{t+1} − F(z̄_t, a_t)‖² + γ · ‖F(z̄_t, a_t) − g‖²
-
-        The stop-gradient on z_t is achieved by using z_t.detach() as input to F.
-
-        Args:
-            virtual_states: (plan_length, 1, V, H, W, D) — z_1 to z_T.
-            virtual_proprios: Optional proprio tensor (plan_length, 1, P).
-            actions: (1, plan_length, A) — a_0 to a_{T-1}.
-            z_init_vid: (1, 1, V, H, W, D) — initial state z_0 (from encoder).
-            z_init_prop: Optional initial proprio z_0.
-            goal_vid: (1, 1, V, H, W, D) — goal state g.
-            goal_prop: Optional goal proprio.
-            plan_length: T, the planning horizon.
-
-        Returns:
-            total_loss: Scalar loss for gradient computation.
-        """
-        dynamics_loss = 0.0
-        goal_loss = 0.0
-
-        for t in range(plan_length):
-            # Get z_t (detached for stop-gradient)
-            if t == 0:
-                z_t = z_init_vid.detach()
-                p_t = z_init_prop.detach() if z_init_prop is not None else None
-            else:
-                z_t = virtual_states[t - 1: t].detach()
-                p_t = virtual_proprios[t - 1: t].detach() if virtual_proprios is not None else None
-
-            # Get target next state z_{t+1}
-            if t < plan_length - 1:
-                z_next = virtual_states[t: t + 1]
-                p_next = virtual_proprios[t: t + 1] if virtual_proprios is not None else None
-            else:
-                z_next = None
-                p_next = None
-
-            # One-step prediction: F(z̄_t, a_t)
-            a_t = actions[:, t: t + 1, :]  # (1, 1, A)
-            pred_vid, pred_prop = self._one_step_predict(z_t, a_t, p_t)
-
-            # Dynamics consistency loss (Eq. 8)
-            if z_next is not None:
-                dyn_diff = (z_next - pred_vid).pow(2).mean()
-                if p_next is not None and pred_prop is not None:
-                    dyn_diff = dyn_diff + (p_next - pred_prop).pow(2).mean()
-                dynamics_loss = dynamics_loss + dyn_diff
-
-            # Dense goal shaping (Eq. 9)
-            goal_diff = (pred_vid - goal_vid).pow(2).mean()
-            if goal_prop is not None and pred_prop is not None:
-                goal_diff = goal_diff + (pred_prop - goal_prop).pow(2).mean()
-            goal_loss = goal_loss + goal_diff
-
-        total_loss = dynamics_loss + self.gamma * goal_loss
-        return total_loss
-
-    def _sync_full_rollout(
-        self,
-        actions: torch.Tensor,
-        z_init,
-        plan_length: int,
-    ):
-        """Full-rollout synchronization phase (Section 3.4).
-
-        Runs J_sync steps of standard gradient descent on the serial rollout
-        objective, updating actions via full backpropagation through the T-step
-        rollout.
-
-        Args:
-            actions: (1, plan_length, A) current action sequence (modified in-place).
-            z_init: Initial latent state for unroll.
-            plan_length: Planning horizon T.
-
-        Returns:
-            actions: Updated actions tensor (still requires_grad).
-        """
-        for _ in range(self.sync_steps):
-            if actions.grad is not None:
-                actions.grad.zero_()
-
-            # Serial rollout: unroll expects actions as (T, B, A)
-            actions_for_unroll = actions.squeeze(0).unsqueeze(1)  # (T, 1, A)
-            predicted_encs = self.unroll(z_init, act_suffix=actions_for_unroll)
-            # Compute objective using the existing planning objective
-            loss = self.objective(predicted_encs, actions_for_unroll)
-            sync_loss = loss.mean()
-            sync_loss.backward()
-
-            with torch.no_grad():
-                actions.data -= self.sync_lr * actions.grad
-                actions.data = self._clip_actions(actions.data)
-            actions.grad.zero_()
-
+                actions[:, :, dims] = actions[:, :, dims].clamp(-maxnorm, maxnorm)
         return actions
 
     def plan(
@@ -632,168 +400,363 @@ class GRASPlanner(Planner):
         z_init,
         steps_left=None,
     ) -> PlanningResult:
-        """Plan using the GRASP algorithm.
+        plan_length = min(self.horizon, steps_left) if steps_left is not None else self.horizon
 
-        Optimizes virtual states and actions jointly using:
-        1. Parallel one-step predictions with grad-cut dynamics loss
-        2. Dense goal shaping on every one-step prediction
-        3. Langevin noise on state iterates for exploration
-        4. Periodic full-rollout synchronization for refinement
+        z_goal = self.objective.target_enc
+        is_tensordict = isinstance(z_init, TensorDict)
+        if is_tensordict:
+            z_init_visual = z_init["visual"]
+            z_init_proprio = z_init["proprio"]
+            z_goal_visual = z_goal["visual"]
+        else:
+            z_init_visual = z_init
+            z_init_proprio = None
+            z_goal_visual = z_goal
 
-        Args:
-            z_init: Initial latent state from EncPredWM.encode().
-                Tensor (1, tau, V, H, W, D) or TensorDict with "visual"/"proprio".
-            steps_left: Optional number of steps left in episode.
+        B = z_init_visual.shape[0]
+        tau = z_init_visual.shape[1]
+        state_shape = z_init_visual.shape[2:]
 
-        Returns:
-            PlanningResult with optimized actions and planning metrics.
-        """
+        s_0 = z_init_visual[:, -1:, ...]
+        proprio_const = z_init_proprio[:, -1:, ...] if z_init_proprio is not None else None
+        if proprio_const is not None:
+            proprio_traj = proprio_const.expand(-1, plan_length, *proprio_const.shape[2:]).clone()
+        else:
+            proprio_traj = None
+        z_goal_flat = z_goal_visual[:, -1:, ...]
+
+        self.enc_pred_wm.model.eval()
+        for p in self.enc_pred_wm.model.parameters():
+            p.requires_grad_(False)
+
+        actions = torch.zeros(plan_length, B, self.action_dim, device=self.device)
+        actions = actions.detach().requires_grad_(True)
+
+        weights = torch.linspace(1.0 / plan_length, 1.0, plan_length, device=self.device)
+        w = weights.view(plan_length, *([1] * (len(state_shape) + 1)))
+        s_0_squeezed = s_0.squeeze(1)
+        g_squeezed = z_goal_flat.squeeze(1)
+        states_interp = (1 - w) * s_0_squeezed.unsqueeze(0) + w * g_squeezed.unsqueeze(0)
+        states = (states_interp + self.epsilon * torch.randn_like(states_interp)).detach()
+        states[-1] = g_squeezed.clone()
+        states = states.requires_grad_(True)
+
+        losses = []
+        predicted_best_encs_over_iterations = []
+        pred_frames_over_iterations = [] if self.decode_each_iteration else None
+
+        if plan_length > 1:
+            win_idx = torch.arange(plan_length - 1, device=self.device).unsqueeze(1) + torch.arange(2, device=self.device).unsqueeze(0)
+
+        for k in range(self.iterations):
+            states_B = states.permute(1, 0, *range(2, states.ndim))
+            full_states = torch.cat([s_0, states_B], dim=1)
+
+            actions_BTA = actions.permute(1, 0, 2)
+            act_feats = self.enc_pred_wm.model.encode_act(actions_BTA)
+
+            vid_ctx_0 = s_0.detach()
+            act_ctx_0 = act_feats[:, 0:1]
+            prop_ctx_0 = proprio_const if z_init_proprio is not None else None
+            pred_0_full, _, _ = self.enc_pred_wm.model.forward_pred(vid_ctx_0, act_ctx_0, prop_ctx_0)
+            pred_0 = pred_0_full[:, -1]
+
+            if plan_length > 1:
+                vid_batch = full_states[:, win_idx].reshape(
+                    B * (plan_length - 1), 2, *state_shape
+                ).detach()
+                act_batch = act_feats[:, win_idx].reshape(
+                    B * (plan_length - 1), 2, self.action_dim
+                )
+                if z_init_proprio is not None:
+                    full_prop = torch.cat([proprio_const, proprio_traj], dim=1)
+                    prop_batch = full_prop[:, win_idx].reshape(
+                        B * (plan_length - 1), 2, *proprio_const.shape[2:]
+                    )
+                else:
+                    prop_batch = None
+
+                batch_preds_full, _, _ = self.enc_pred_wm.model.forward_pred(
+                    vid_batch, act_batch, prop_batch
+                )
+                batch_preds = batch_preds_full[:, -1]
+                batch_preds = batch_preds.view(plan_length - 1, B, *batch_preds.shape[1:])
+                all_preds = torch.cat([pred_0.unsqueeze(0), batch_preds], dim=0)
+            else:
+                all_preds = pred_0.unsqueeze(0)
+
+            states_target = full_states[:, 1:].permute(
+                1, 0, *range(2, full_states.ndim)
+            )
+            dyn_loss = (all_preds - states_target).pow(2).sum(0).mean()
+
+            pred_stack = all_preds
+            if is_tensordict:
+                proprio_expanded = proprio_traj.permute(
+                    1, 0, *range(2, proprio_traj.ndim)
+                )
+                pred_for_obj = TensorDict({"visual": pred_stack, "proprio": proprio_expanded})
+            else:
+                pred_for_obj = pred_stack
+            goal_loss = self.objective(pred_for_obj, actions_BTA, keepdims=True)
+            goal_loss = goal_loss.sum(0).mean()
+
+            total_loss = dyn_loss + self.gamma * goal_loss
+            losses.append(total_loss.item())
+
+            grad_actions, grad_states = torch.autograd.grad(total_loss, [actions, states])
+
+            grad_states[-1] = 0
+            noise = self.state_sigma * torch.randn_like(states)
+            noise[-1] = 0
+            actions = self._clip_actions(actions - self.action_lr * grad_actions).detach().requires_grad_(True)
+            states = (states - self.state_lr * grad_states + noise).detach()
+            states[-1] = g_squeezed.clone()
+            states = states.requires_grad_(True)
+
+            if (k + 1) % self.K_sync == 0:
+                for _ in range(self.J_sync):
+                    actions_for_sync = actions.detach().clone().requires_grad_(True)
+                    sync_rollout = self.unroll(z_init, act_suffix=actions_for_sync)
+                    if is_tensordict:
+                        final_state = sync_rollout["visual"][-1:]
+                    else:
+                        final_state = sync_rollout[-1:]
+                    sync_goal_loss = (final_state - z_goal_flat).pow(2).mean()
+                    grad_sync = torch.autograd.grad(sync_goal_loss, actions_for_sync)[0]
+                    actions = self._clip_actions(actions - self.sync_lr * grad_sync).detach().requires_grad_(True)
+
+                with torch.no_grad():
+                    sync_rollout = self.unroll(z_init, act_suffix=actions.detach())
+                    if is_tensordict:
+                        new_states = sync_rollout["visual"][tau:]
+                        new_proprio = sync_rollout["proprio"][tau:]
+                        proprio_traj = new_proprio.permute(1, 0, *range(2, new_proprio.ndim)).detach()
+                    else:
+                        new_states = sync_rollout[tau:]
+                    states_data = new_states.detach()
+                    states_data[-1] = g_squeezed.clone()
+                    states = states_data.requires_grad_(True)
+
+            if self.decode_each_iteration and self.decode_unroll is not None:
+                with torch.no_grad():
+                    pred_encs = self.unroll(z_init, act_suffix=actions.detach())
+                    predicted_best_encs_over_iterations.append(pred_encs)
+                    pred_frames_over_iterations.append(self.decode_unroll(pred_encs))
+
+        with torch.no_grad():
+            final_pred_encs = self.unroll(z_init, act_suffix=actions.detach())
+            predicted_best_encs_over_iterations.append(final_pred_encs)
+
+        final_actions = actions.detach().squeeze(1)
+        result = PlanningResult(
+            actions=final_actions[: self.num_act_stepped] if self.num_act_stepped else final_actions,
+            losses=torch.tensor(losses).detach().unsqueeze(-1),
+            prev_elite_losses_mean=torch.tensor(losses).detach().unsqueeze(-1),
+            prev_elite_losses_std=torch.zeros(len(losses)).unsqueeze(-1),
+            pred_frames_over_iterations=pred_frames_over_iterations,
+            predicted_best_encs_over_iterations=predicted_best_encs_over_iterations,
+        )
+        return result
+
+
+class CEMGDPlanner(Planner):
+    """CEM-GD Planner: Cross-Entropy Method with Gradient Descent refinement.
+
+    Combines CEM sampling with gradient-based optimization:
+    1. Sample N action sequences from a Gaussian, iterate CEM to refine the distribution.
+    2. Select top-k elite sequences from the final CEM distribution.
+    3. Refine each elite with G gradient descent steps, trying J geometrically-decaying
+       step sizes (eta_init * rho^j for j=0..J-1) and keeping the best.
+    4. Pick the overall best refined sequence and execute the first action(s).
+    """
+
+    def __init__(
+        self,
+        unroll: Callable,
+        action_dim: int,
+        horizon: int = 32,
+        # CEM parameters
+        num_samples: int = 512,
+        var_scale: float = 1.0,
+        num_elites: int = 64,
+        iterations: int = 6,
+        momentum_mean: float = 0.0,
+        momentum_std: float = 0.0,
+        # GD refinement parameters
+        top_k: int = 1,
+        gd_steps: int = 10,
+        gd_lr_init: float = 0.01,
+        gd_lr_decay: float = 0.67,
+        gd_num_lrs: int = 8,
+        # Action clipping
+        max_norms: List[float] = None,
+        max_norm_dims: List[List[int]] = [[0, 1, 2], [6]],
+        # Output
+        num_act_stepped: int = None,
+        decode_each_iteration: bool = False,
+        decode_unroll: Callable = None,
+        # Distribution
+        distribute_planner: bool = False,
+        local_generator: torch.Generator = None,
+        **kwargs,
+    ):
+        super().__init__(unroll)
+        self.action_dim = action_dim
+        self.horizon = horizon
+        self.device = torch.device("cuda")
+        self.num_samples = num_samples
+        self.var_scale = var_scale
+        self.num_elites = num_elites
+        self.iterations = iterations
+        self.momentum_mean = momentum_mean
+        self.momentum_std = momentum_std
+        self.top_k = top_k
+        self.gd_steps = gd_steps
+        self.gd_lr_init = gd_lr_init
+        self.gd_lr_decay = gd_lr_decay
+        self.gd_num_lrs = gd_num_lrs
+        self.max_norms = max_norms
+        self.max_norm_dims = max_norm_dims
+        self.num_act_stepped = num_act_stepped
+        self.decode_each_iteration = decode_each_iteration
+        self.decode_unroll = decode_unroll
+        self.distribute_planner = distribute_planner
+        self.local_generator = local_generator
+
+    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.max_norms is not None:
+            for dims, maxnorm in zip(self.max_norm_dims, self.max_norms):
+                actions[..., dims] = torch.clip(actions[..., dims], min=-maxnorm, max=maxnorm)
+        return actions
+
+    def _gd_refine(self, actions_init: torch.Tensor, z_init: torch.Tensor) -> torch.Tensor:
+        actions = actions_init.clone().unsqueeze(0).detach().requires_grad_(True)
+        decay = self.gd_lr_decay if 0.0 < self.gd_lr_decay < 1.0 else 0.5
+
+        for _ in range(self.gd_steps):
+            if actions.grad is not None:
+                actions.grad.zero_()
+
+            actions_for_unroll = actions.squeeze(0).unsqueeze(1)
+            predicted_encs = self.unroll(z_init, act_suffix=actions_for_unroll)
+            loss = self.objective(predicted_encs, actions_for_unroll)
+            current_cost = loss.mean()
+            current_cost.backward()
+
+            if actions.grad is None:
+                continue
+
+            with torch.no_grad():
+                grad = actions.grad.detach().clone()
+                if not torch.isfinite(grad).all():
+                    actions.grad.zero_()
+                    continue
+
+                base_actions = actions.detach().clone()
+                base_cost = current_cost.detach()
+                lr = self.gd_lr_init
+
+                for _ in range(self.gd_num_lrs):
+                    candidate = self._clip_actions(base_actions - lr * grad)
+                    candidate_for_unroll = candidate.squeeze(0).unsqueeze(1)
+                    candidate_cost = self.cost_function(candidate_for_unroll, z_init).mean()
+
+                    if torch.isfinite(candidate_cost) and candidate_cost < base_cost:
+                        actions.copy_(candidate)
+                        break
+
+                    lr *= decay
+
+            actions.grad.zero_()
+
+        return actions.squeeze(0).detach().clone()
+
+    def plan(
+        self,
+        z_init: torch.Tensor,
+        steps_left: int = None,
+    ) -> PlanningResult:
         if steps_left is not None:
             plan_length = min(self.horizon, steps_left)
         else:
             plan_length = self.horizon
 
-        # Extract visual & proprio features from z_init
-        z_init_prop = None
-        has_proprio = False
-        if isinstance(z_init, dict) or hasattr(z_init, 'keys'):
-            z_init_vid = z_init["visual"]  # (1, tau, V, H, W, D)
-            if "proprio" in z_init and z_init["proprio"] is not None:
-                has_proprio = True
-                z_init_prop = z_init["proprio"][:, -1:, ...]
-        else:
-            z_init_vid = z_init  # (1, tau, V, H, W, D)
-
-        # Use only the last frame as the initial state for planning
-        z_init_vid_last = z_init_vid[:, -1:, ...]  # (1, 1, V, H, W, D)
-
-        # Extract goal visual & proprio encoding
-        assert self.goal_enc is not None, "Goal encoding must be set via set_goal_enc() before planning."
-        goal_prop = None
-        if isinstance(self.goal_enc, dict) or hasattr(self.goal_enc, 'keys'):
-            goal_vid = self.goal_enc["visual"]  # (1, tau, V, H, W, D)
-            if "proprio" in self.goal_enc and self.goal_enc["proprio"] is not None:
-                goal_prop = self.goal_enc["proprio"][:, -1:, ...]
-        else:
-            goal_vid = self.goal_enc
-        goal_vid = goal_vid[:, -1:, ...]  # (1, 1, V, H, W, D)
-
-        # Get state shape from z_init
-        _, _, V, H, W, D = z_init_vid_last.shape
-
-        # --- Initialize actions ---
-        if self.action_init == "zero":
-            actions = torch.zeros(1, plan_length, self.action_dim, device=self.device)
-        else:  # "randn"
-            actions = torch.randn(1, plan_length, self.action_dim, device=self.device) * self.var_scale
-        actions = self._clip_actions(actions)
-        actions = actions.detach().requires_grad_(True)
-
-        # --- Initialize virtual states z_1, ..., z_T ---
-        virtual_proprios = None
-        if self.state_init == "rollout" and plan_length > 0:
-            # Initialize by doing a serial rollout with initial actions
-            with torch.no_grad():
-                init_acts_for_unroll = actions.squeeze(0).unsqueeze(1)  # (T, 1, A)
-                init_rollout = self.unroll(z_init, act_suffix=init_acts_for_unroll)
-                if isinstance(init_rollout, dict) or hasattr(init_rollout, 'keys'):
-                    init_vid = init_rollout["visual"]  # (T+tau, 1, V, H, W, D)
-                    if has_proprio and "proprio" in init_rollout:
-                        tau_p = z_init_prop.shape[1] if has_proprio else 0
-                        virtual_proprios = init_rollout["proprio"][tau_p:, ...].clone()
-                        virtual_proprios = virtual_proprios.detach().requires_grad_(True)
-                else:
-                    init_vid = init_rollout
-                # Take the predicted states (skip context frames)
-                tau = z_init_vid.shape[1]
-                virtual_states = init_vid[tau:, ...].clone()  # (T, 1, V, H, W, D)
-        elif self.state_init == "zero":
-            virtual_states = torch.zeros(plan_length, 1, V, H, W, D, device=self.device)
-            if has_proprio:
-                virtual_proprios = torch.zeros(plan_length, *z_init_prop.shape[1:], device=self.device)
-                virtual_proprios = virtual_proprios.detach().requires_grad_(True)
-        else:  # "randn"
-            virtual_states = torch.randn(plan_length, 1, V, H, W, D, device=self.device) * self.var_scale
-            if has_proprio:
-                virtual_proprios = torch.randn(plan_length, *z_init_prop.shape[1:], device=self.device) * self.var_scale
-                virtual_proprios = virtual_proprios.detach().requires_grad_(True)
-        virtual_states = virtual_states.detach().requires_grad_(True)
-
-        # --- Tracking ---
+        mean = torch.zeros(plan_length, self.action_dim, device=self.device)
+        std = self.var_scale * torch.ones(plan_length, self.action_dim, device=self.device)
+        actions = torch.empty(
+            plan_length, self.num_samples, self.action_dim, device=self.device,
+        )
         losses = []
+        elite_means, elite_stds = [], []
         predicted_best_encs_over_iterations = []
         pred_frames_over_iterations = [] if self.decode_each_iteration else None
 
-        # --- Main GRASP optimization loop ---
-        self.enc_pred_wm.model.eval()
+        with torch.no_grad():
+            for itr in range(self.iterations):
+                actions[:, :] = mean.unsqueeze(1) + std.unsqueeze(1) * torch.randn(
+                    plan_length, self.num_samples, self.action_dim,
+                    device=self.device, generator=self.local_generator,
+                )
+                actions[:, 0, :] = mean
+                if self.max_norms is not None:
+                    for h in range(plan_length):
+                        for dims, maxnorm in zip(self.max_norm_dims, self.max_norms):
+                            actions[h, :, dims] = torch.clip(actions[h, :, dims], min=-maxnorm, max=maxnorm)
+                cost = self.cost_function(actions, z_init).unsqueeze(1)
+                losses.append(cost.min().item())
+                if self.distribute_planner:
+                    cost = torch.cat(FullGatherLayer.apply(cost), dim=0)
+                    all_actions = torch.cat(FullGatherLayer.apply(actions), dim=1)
+                else:
+                    all_actions = actions
+                elite_idxs = torch.topk(-cost.squeeze(1), self.num_elites, dim=0).indices
+                elite_loss, elite_actions = cost[elite_idxs], all_actions[:, elite_idxs]
+                elite_means.append(elite_loss.mean().item())
+                elite_stds.append(elite_loss.std().item())
+                new_mean = torch.mean(elite_actions, dim=1)
+                new_std = torch.std(elite_actions, dim=1)
+                mean = new_mean * (1 - self.momentum_mean) + mean * self.momentum_mean
+                std = new_std * (1 - self.momentum_std) + std * self.momentum_std
 
-        for itr in range(self.steps):
-            # Zero any existing gradients
-            if actions.grad is not None:
-                actions.grad.zero_()
-            if virtual_states.grad is not None:
-                virtual_states.grad.zero_()
-            if virtual_proprios is not None and virtual_proprios.grad is not None:
-                virtual_proprios.grad.zero_()
+            top_k_idxs = torch.topk(-cost.squeeze(1), self.top_k, dim=0).indices
+            top_k_actions = all_actions[:, top_k_idxs, :]
 
-            # Compute GRASP loss (grad-cut dynamics + dense goal shaping)
-            total_loss = self._compute_grasp_loss(
-                virtual_states, virtual_proprios, actions,
-                z_init_vid_last, z_init_prop, goal_vid, goal_prop, plan_length,
-            )
-            total_loss.backward()
-            losses.append(total_loss.item())
+        best_overall_cost = float("inf")
+        best_overall_actions = None
 
-            # --- Update actions via gradient descent ---
+        for i in range(self.top_k):
+            candidate = top_k_actions[:, i, :]
+            refined = self._gd_refine(candidate, z_init)
+
             with torch.no_grad():
-                actions.data -= self.action_lr * actions.grad
-                actions.data = self._clip_actions(actions.data)
+                refined_for_unroll = refined.unsqueeze(1)
+                refined_cost = self.cost_function(refined_for_unroll, z_init).item()
 
-            # --- Update virtual states via gradient descent + Langevin noise ---
-            with torch.no_grad():
-                if virtual_states.grad is not None:
-                    virtual_states.data -= self.state_lr * virtual_states.grad
-                if virtual_proprios is not None and virtual_proprios.grad is not None:
-                    virtual_proprios.data -= self.state_lr * virtual_proprios.grad
-                    
-                # Langevin noise injection (Eq. 5)
-                if self.state_noise_std > 0:
-                    virtual_states.data += torch.randn_like(virtual_states) * self.state_noise_std
-                    if virtual_proprios is not None:
-                        virtual_proprios.data += torch.randn_like(virtual_proprios) * self.state_noise_std
+            if refined_cost < best_overall_cost:
+                best_overall_cost = refined_cost
+                best_overall_actions = refined
 
-            # Zero gradients after update
-            if actions.grad is not None:
-                actions.grad.zero_()
-            if virtual_states.grad is not None:
-                virtual_states.grad.zero_()
-            if virtual_proprios is not None and virtual_proprios.grad is not None:
-                virtual_proprios.grad.zero_()
+        losses.append(best_overall_cost)
 
-            # --- Full-rollout synchronization (Section 3.4) ---
-            if self.sync_every > 0 and (itr + 1) % self.sync_every == 0:
-                actions = self._sync_full_rollout(actions, z_init, plan_length)
+        with torch.no_grad():
+            final_for_unroll = best_overall_actions.unsqueeze(1)
+            predicted_best_encs = self.unroll(z_init, act_suffix=final_for_unroll)
+            predicted_best_encs_over_iterations.append(predicted_best_encs)
+            if self.decode_each_iteration and self.decode_unroll is not None:
+                pred_frames = self.decode_unroll(predicted_best_encs)
+                pred_frames_over_iterations.append(pred_frames)
 
-            # --- Record predictions for logging (periodic, not every iteration) ---
-            if itr == self.steps - 1 or (self.decode_each_iteration and itr % max(1, self.steps // 10) == 0):
-                with torch.no_grad():
-                    acts_for_unroll = actions.squeeze(0).unsqueeze(1)  # (T, 1, A)
-                    predicted_best_encs = self.unroll(z_init, act_suffix=acts_for_unroll)
-                    predicted_best_encs_over_iterations.append(predicted_best_encs)
-                    if self.decode_each_iteration and self.decode_unroll is not None:
-                        pred_frames = self.decode_unroll(predicted_best_encs)
-                        pred_frames_over_iterations.append(pred_frames)
+        a = best_overall_actions[: self.num_act_stepped] if self.num_act_stepped else best_overall_actions
+        if self.distribute_planner:
+            dist.broadcast(a, src=0)
 
-        # --- Final actions ---
-        final_actions = actions.squeeze(0).detach()  # (T, A)
-        a = final_actions[: self.num_act_stepped] if self.num_act_stepped else final_actions
         losses_tensor = torch.tensor(losses).detach().unsqueeze(-1)
-
         result = PlanningResult(
             actions=a,
             losses=losses_tensor,
-            prev_elite_losses_mean=losses_tensor,  # No elites in GRASP; use raw losses
-            prev_elite_losses_std=torch.zeros_like(losses_tensor),
+            prev_elite_losses_mean=torch.tensor(elite_means).unsqueeze(-1),
+            prev_elite_losses_std=torch.tensor(elite_stds).unsqueeze(-1),
             pred_frames_over_iterations=pred_frames_over_iterations if self.decode_each_iteration else None,
             predicted_best_encs_over_iterations=predicted_best_encs_over_iterations,
         )
