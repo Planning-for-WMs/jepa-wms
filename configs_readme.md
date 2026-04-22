@@ -294,3 +294,69 @@ Environment-specific parameters passed to the environment constructor.
 | Parameter | Type | Example | Description |
 |---|---|---|---|
 | `use_fsdp` | `bool` | `false` | Whether to use Fully Sharded Data Parallel (FSDP) for model sharding across GPUs. Typically `false` during evaluation since the model is frozen and inference-only. |
+
+---
+
+## Environment Variables
+
+Config YAML files use `${VAR_NAME}` placeholders that are expanded at load time by `src/utils/yaml_utils.py`. You can set these in your shell profile, or create a `.env` file in the repo root (gitignored, auto-loaded).
+
+Copy `.env.template` to `.env` and fill in your paths:
+
+```bash
+cp .env.template .env
+```
+
+| Variable | Purpose |
+|---|---|
+| `JEPAWM_LOGS` | Root directory for training and eval logs/outputs |
+| `JEPAWM_DSET` | Root directory for datasets (PushT, MetaWorld, etc.) |
+| `JEPAWM_CKPT` | Root directory for model checkpoints |
+| `JEPAWM_OSSCKPT` | Root directory for open-source pretrained encoder checkpoints (V-JEPA, DINOv2) |
+
+---
+
+## Config Organization
+
+| Directory | Tracked | Purpose |
+|---|---|---|
+| `configs/vjepa_wm/` | Yes | Base training configs |
+| `configs/evals/` | Yes | Base evaluation configs |
+| `configs/online_plan_evals/` | Yes | Online planning eval configs |
+| `configs/local/` | No (gitignored) | Personal experiment configs |
+| `app/*/local/` | No (gitignored) | App-specific personal configs |
+| `evals/*/local/` | No (gitignored) | Eval-specific personal configs |
+| `*/dump_online_evals/*` | No (gitignored) | Auto-generated eval configs |
+
+---
+
+## Config-Driven Feature Selection
+
+All experiment features coexist on one branch and are toggled via config:
+
+| Feature | Config key | Default | Effect |
+|---|---|---|---|
+| Token Merging (ToMe) | `predictor.tome_r` | `0` (off) | Set >0 to merge tokens |
+| CLS vs full-patch | `visual_encoder.feature_key` | `x_norm_patchtokens` | Set to `x_norm_clstoken` for CLS |
+| Precomputed features | `visual_encoder.enc_type` | `dino` | Set to `precomputed` for cached features |
+| Planner | `planner.planner_name` | `cem` | `cem`, `grasp`, `cem_gd`, `gd`, `adam`, `mppi`, `nevergrad` |
+| Wandb (training) | `logging.wandb.project` | `vjepa_wm` | Wandb project for training runs |
+| Wandb (eval) | `logging.wandb.project` | `jepa_wm_eval` | Wandb project for eval runs |
+
+---
+
+## Run Tracking
+
+Every training and eval run generates a unique run ID (`YYYYMMDD_HHMMSS_hexhash`) and creates an isolated output directory:
+
+```
+${JEPAWM_LOGS}/experiment_name/
+  runs/
+    20260422_143052_a3f1b2/
+      config_resolved.yaml    # Full expanded config snapshot
+      run_meta.json           # Git commit, hostname, timestamp
+      log_r0.csv              # Training metrics (training only)
+      eval.csv                # Eval metrics
+    latest -> runs/20260422_143052_a3f1b2
+  jepa-latest.pth.tar         # Checkpoints (experiment-level, shared across runs)
+```
