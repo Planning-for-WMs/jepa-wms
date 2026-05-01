@@ -11,6 +11,7 @@ from evals.simu_env_planning.planning.planning.objectives import (
     ReprTargetDistL1MPCObjective,
     ReprTargetDistMPCObjective,
 )
+from evals.simu_env_planning.planning.planning.hierarchical_planner import TwoLvlPlanner
 from evals.simu_env_planning.planning.planning.planner import (
     AdamPlanner,
     CEMGDPlanner,
@@ -109,6 +110,15 @@ class GC_Agent:
                 decode_unroll=self.model.decode_unroll,
                 **self.cfg.planner,
             )
+        elif self.cfg.planner.planner_name == "hierarchical":
+            self.planner = TwoLvlPlanner(
+                unroll=self.model.unroll,
+                action_dim=self.model.action_dim,
+                l2_model=self.model.l2_model,
+                local_generator=self.local_gpu_generator,
+                decode_unroll=self.model.decode_unroll,
+                **self.cfg.planner,
+            )
         else:
             raise ValueError(f"Unknown planner: {self.cfg.planner}")
 
@@ -139,6 +149,12 @@ class GC_Agent:
 
         if self.planner is not None:
             self.planner.set_objective(self.objective)
+
+        if hasattr(self.planner, "set_l2_objective"):
+            l2_obj = ReprTargetDistMPCObjective(
+                self.cfg, target_enc=self.goal_state_enc, **self.cfg.planner.planning_objective
+            )
+            self.planner.set_l2_objective(l2_obj)
 
     def plan(
         self,
