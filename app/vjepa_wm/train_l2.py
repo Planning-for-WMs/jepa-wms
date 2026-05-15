@@ -319,6 +319,10 @@ def main(args):
     ctxt_window = cfgs_l2.get("ctxt_window", 2)
 
     cfgs_l2_pred = cfgs_l2["predictor"]
+    cfgs_bsm = cfgs_l2.get("bsm", {})
+    bsm_r = cfgs_bsm.get("r", grid_size * grid_size // 2)
+    bsm_metric_dim = cfgs_bsm.get("metric_dim", 64)
+    n_abs = grid_size * grid_size - bsm_r
     local_window = tuple(cfgs_l2_pred.get("local_window", [3, -1, -1]))
     patch_size = 14  # DINO ViT-S/14
     l2_predictor = vit_predictor_AdaLN(
@@ -340,6 +344,8 @@ def main(args):
         proprio_emb_dim=cfgs_l2_pred.get("proprio_emb_dim", 0),
         proprio_encoder_inpred=True,
         local_window=local_window,
+        external_merge=True,
+        external_n_abs=n_abs,
     ).to(device)
 
     cfgs_ae = cfgs_l2["action_encoder"]
@@ -359,6 +365,8 @@ def main(args):
         grid_size=grid_size,
         normalize_reps=normalize_reps,
         ctxt_window=ctxt_window,
+        r=bsm_r,
+        bsm_metric_dim=bsm_metric_dim,
     ).to(device)
 
     pred_params = sum(p.numel() for p in l2_predictor.parameters())
@@ -472,12 +480,11 @@ def main(args):
                 wp_proprios = wp_proprios.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", dtype=dtype):
-                pred_features, pred_proprios, latent_actions = (
+                pred_features, pred_proprios, latent_actions, target_features = (
                     l2_model.forward_teacher_forcing(
                         wp_features, action_chunks, chunk_lengths, wp_proprios,
                     )
                 )
-                target_features = wp_features[:, 1:]
                 target_proprios = (
                     wp_proprios[:, 1:] if wp_proprios is not None else None
                 )

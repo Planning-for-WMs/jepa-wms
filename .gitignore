@@ -36,4 +36,7 @@ logs/
 configs/online_plan_evals/pt/gd/pt_L2_gd_sourcedset_H6_nas6_ctxt2_cls.yaml
 saved_checkpoints/
 
+L2_ABSTRACT_ENCODER_PLAN.md
+TWO_LVL_PLANNER_REWRITE_PLAN.md
+
 .claude

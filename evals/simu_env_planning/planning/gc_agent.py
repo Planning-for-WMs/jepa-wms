@@ -156,6 +156,9 @@ class GC_Agent:
             )
             self.planner.set_l2_objective(l2_obj)
 
+        if hasattr(self.planner, "reset"):
+            self.planner.reset()
+
     def plan(
         self,
         z,

@@ -1,9 +1,11 @@
-folder: ${JEPAWM_LOGS}/l2/pt_l2
-checkpoint_folder: ${JEPAWM_CKPT}/l2/pt_l2
+folder: ${JEPAWM_LOGS}/l2/pt_l2_abs
+checkpoint_folder: ${JEPAWM_CKPT}/l2/pt_l2_abs
 seed: 234
 quick_debug: false
 
 # ─── Precomputed feature cache ─────────────────────────────────────────────
+# Reuse the existing same-space cache — DINO features are identical regardless
+# of whether L2 runs in raw or abstract space.
 precompute:
   cache_path: ${JEPAWM_CKPT}/l2/pt_l2/dino_features.h5
   encode_batch_size: 2048

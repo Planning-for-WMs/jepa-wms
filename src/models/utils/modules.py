@@ -186,8 +186,24 @@ class RoPEAttention(nn.Module):
         width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
         return 1.0 * frame_ids, 1.0 * height_ids, 1.0 * width_ids
 
-    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
+    def forward(
+        self,
+        x,
+        mask=None,
+        attn_mask=None,
+        T=None,
+        H=None,
+        W=None,
+        action_tokens=0,
+        n_visual_per_frame=None,
+    ):
         B, N, C = x.size()
+
+        # n_visual_per_frame allows non-grid layouts (e.g. external token-merging
+        # encoders that reduce H*W → N_abs). Positions in `mask` still live on
+        # the original H*W grid so RoPE math is unchanged.
+        if n_visual_per_frame is None:
+            n_visual_per_frame = H * W
 
         # -- compute position of each frame token
         if mask is not None:
@@ -203,7 +219,7 @@ class RoPEAttention(nn.Module):
 
         # -- split out action tokens from sequence
         if action_tokens > 0:
-            x = x.view(B, -1, action_tokens + H * W, C)  # [B, T, 1+H*W, D]
+            x = x.view(B, -1, action_tokens + n_visual_per_frame, C)  # [B, T, A+N_vis, D]
 
             action_q, action_k, action_v = [], [], []
             for i in range(action_tokens):
@@ -258,7 +274,7 @@ class RoPEAttention(nn.Module):
 
             def merge_(tx, ta):
                 """tx, tx in [B, num_heads, N, D]"""
-                tx = tx.view(B, self.num_heads, T, H * W, -1)  # [B, T, H*W, D]
+                tx = tx.view(B, self.num_heads, T, n_visual_per_frame, -1)  # [B, T, N_vis, D]
                 ta = ta.view(B, self.num_heads, T, action_tokens, -1)  # [B, T, A, D]
                 return torch.cat([ta, tx], dim=3).flatten(2, 3)
 

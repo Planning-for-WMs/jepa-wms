@@ -5,16 +5,24 @@ from einops import rearrange
 from tensordict.tensordict import TensorDict
 
 from app.plan_common.models.latent_action_encoder import LatentActionEncoder
+from app.vjepa_wm.bsm_encoder import (
+    apply_merge_to_features,
+    encode_segment,
+    encode_with_reference,
+)
 
 
 class L2WorldModel(nn.Module):
-    """Level-2 hierarchical world model operating on waypoint states with latent macro-actions.
+    """Level-2 hierarchical world model operating on abstract waypoint states.
 
-    Wraps a scaled-up AdaLN ViT predictor and a transformer-based latent action encoder.
-    Both levels share the same frozen DINO encoder, so L2 operates in the same spatial
-    feature space as L1.
+    A frozen DINO encoder produces (B, T, V, H, W, D) features; the L2 model
+    further compresses each frame into N_abs<H*W tokens via Bipartite Soft
+    Matching (BSM) — a deterministic encoder locked to a single reference
+    state per segment (or to z_init at planning time). The predictor then
+    operates entirely in this abstract space.
 
-    Reference: "Hierarchical World Models" (arxiv 2604.03208).
+    Reference: "Hierarchical World Models" (arxiv 2604.03208), with the L2
+    abstract-encoder modification documented in L2_ABSTRACT_ENCODER_PLAN.md.
     """
 
     def __init__(
@@ -25,6 +33,8 @@ class L2WorldModel(nn.Module):
         grid_size=16,
         normalize_reps=False,
         ctxt_window=2,
+        r=128,
+        bsm_metric_dim=64,
     ):
         super().__init__()
         self.predictor = l2_predictor
@@ -34,21 +44,16 @@ class L2WorldModel(nn.Module):
         self.normalize_reps = normalize_reps
         self.ctxt_window = ctxt_window
         self.latent_action_dim = action_encoder.latent_action_dim
+        self.r = r
+        self.bsm_metric_dim = bsm_metric_dim
+        self.n_abs = grid_size * grid_size - r
 
     @property
     def z_dim(self):
         return self.latent_action_dim
 
     def encode_action_chunks(self, action_chunks, chunk_lengths=None):
-        """Encode variable-length action chunks into latent macro-actions.
-
-        Args:
-            action_chunks: (B, N_transitions, max_chunk_size, action_dim)
-            chunk_lengths: (B, N_transitions) or None
-
-        Returns:
-            latent_actions: (B, N_transitions, latent_action_dim)
-        """
+        """Encode variable-length action chunks into latent macro-actions."""
         B, N, T_max, A = action_chunks.shape
         chunks_flat = action_chunks.reshape(B * N, T_max, A)
         lengths_flat = chunk_lengths.reshape(B * N) if chunk_lengths is not None else None
@@ -65,51 +70,50 @@ class L2WorldModel(nn.Module):
         """Training forward pass with teacher-forcing on waypoint sequences.
 
         Args:
-            waypoint_features: (B, N, V, H, W, D) — N waypoint states from frozen DINO encoder
-            action_chunks: (B, N-1, max_chunk_size, action_dim) — raw actions between waypoints
-            chunk_lengths: (B, N-1) — actual length of each chunk
-            waypoint_proprios: (B, N, P) or None — proprio at waypoints
+            waypoint_features: (B, N, V, H, W, D) — N waypoint states from DINO
+            action_chunks: (B, N-1, max_chunk_size, action_dim)
+            chunk_lengths: (B, N-1)
+            waypoint_proprios: (B, N, P) or None
 
         Returns:
-            pred_features: (B, N-1, V, H, W, D) — predicted next waypoint features
-            pred_proprios: (B, N-1, 1, P) or None
-            latent_actions: (B, N-1, latent_action_dim) — encoded latent actions
+            pred_abs:        (B, N-1, N_abs, D) — predicted next-waypoint features in abstract space
+            pred_proprios:   (B, N-1, 1, P) or None
+            latent_actions:  (B, N-1, latent_action_dim)
+            target_abs:      (B, N-1, N_abs, D) — BSM-encoded ground-truth next waypoints
         """
-        B, N, V, H, W, D = waypoint_features.shape
+        # Lock the BSM partition to the first waypoint of the segment, then
+        # apply the same merge_fn to every waypoint.
+        enc = encode_segment(
+            waypoint_features, reference_idx=0, r=self.r, metric_dim=self.bsm_metric_dim
+        )
+        abs_feats = enc["abstract"]   # (B, N, N_abs, D)
+        pos_ids = enc["pos_ids"]      # (B, N_abs)
+        sizes = enc["sizes"]          # (B, N_abs)
 
         latent_actions = self.encode_action_chunks(action_chunks, chunk_lengths)
 
-        input_features = waypoint_features[:, :-1]
-        latent_acts_for_pred = latent_actions
+        inp = abs_feats[:, :-1]                                  # (B, N-1, N_abs, D)
+        T_in = inp.size(1)
+        pos_t = pos_ids.unsqueeze(1).expand(-1, T_in, -1)        # (B, T_in, N_abs)
+        sizes_t = sizes.unsqueeze(1).expand(-1, T_in, -1)        # (B, T_in, N_abs)
 
-        pred_video, _, pred_proprio = self.predictor(
-            input_features,
-            latent_acts_for_pred,
+        pred_abs, _, pred_proprio = self.predictor(
+            inp,
+            latent_actions,
             waypoint_proprios[:, :-1] if waypoint_proprios is not None else None,
-        )
-
-        pred_video = rearrange(
-            pred_video, "b t (v h w) d -> b t v h w d",
-            h=self.grid_size, w=self.grid_size, v=1,
+            external_pos_ids=pos_t,
+            external_sizes=sizes_t,
         )
 
         if self.normalize_reps:
-            pred_video = F.layer_norm(pred_video, (pred_video.size(-1),))
+            pred_abs = F.layer_norm(pred_abs, (pred_abs.size(-1),))
 
-        return pred_video, pred_proprio, latent_actions
+        return pred_abs, pred_proprio, latent_actions, abs_feats[:, 1:]
 
     def compute_loss(self, pred_features, target_features, pred_proprios=None, target_proprios=None):
-        """L1 loss between predicted and actual waypoint features (paper Equation 1).
+        """L1 loss between predicted and actual abstract waypoint features.
 
-        Args:
-            pred_features: (B, N-1, V, H, W, D)
-            target_features: (B, N-1, V, H, W, D) — actual next waypoint features
-            pred_proprios: (B, N-1, ...) or None
-            target_proprios: (B, N-1, ...) or None
-
-        Returns:
-            loss: scalar
-            loss_dict: dict with detailed losses for logging
+        Both inputs are (B, T, N_abs, D) — no spatial grid axes.
         """
         visual_loss = F.l1_loss(pred_features, target_features)
 
@@ -125,15 +129,23 @@ class L2WorldModel(nn.Module):
         loss_dict["l2_total_loss"] = loss.item()
         return loss, loss_dict
 
-    def unroll(self, z_ctxt, act_suffix=None, debug=False):
-        """Autoregressive prediction for planning — matches EncPredWM.unroll interface.
+    def unroll(self, z_ctxt, act_suffix=None, debug=False, reference=None):
+        """Autoregressive prediction for planning.
+
+        Builds a BSM partition from ``reference`` (or, if not provided, from
+        the first context frame) and runs the L2 predictor entirely in the
+        abstract space.
 
         Args:
-            z_ctxt: (B, tau, V, H, W, D) or TensorDict — initial waypoint state(s)
-            act_suffix: (T, B, latent_action_dim) — latent macro-actions from planner
+            z_ctxt: (B, tau, V, H, W, D) raw DINO features, or TensorDict with
+                a ``visual`` key of that shape.
+            act_suffix: (T, B, latent_action_dim) — latent macro-actions.
+            reference: (B, V, H, W, D) state used to lock the BSM partition.
+                Defaults to ``z_ctxt[:, 0]`` (or its visual component).
 
         Returns:
-            (T+tau, B, V, H, W, D) or TensorDict — predicted waypoint trajectory
+            (T+tau, B, N_abs, D) abstract trajectory, or TensorDict with that
+            visual tensor plus passthrough proprio.
         """
         T, B_act, A = act_suffix.shape
         has_proprio = False
@@ -162,6 +174,22 @@ class L2WorldModel(nn.Module):
                 )
                 out_prop = raw_prop
 
+        # Build the BSM partition. By default the reference is the latest ctxt
+        # frame (the agent's "current state"), matching what the hierarchical
+        # planner uses to lock its goal/L1 partition.
+        if reference is None:
+            reference_visual = vid_feats[:, -1]
+        else:
+            reference_visual = reference[:, 0] if reference.dim() == 6 else reference
+
+        enc = encode_with_reference(
+            vid_feats, reference_visual, r=self.r, metric_dim=self.bsm_metric_dim
+        )
+        abs_feats = enc["abstract"]   # (B_act, tau, N_abs, D)
+        pos_ids = enc["pos_ids"]      # (B_act, N_abs)
+        sizes = enc["sizes"]          # (B_act, N_abs)
+        merge_fn = enc["merge_fn"]
+
         act_suffix = rearrange(act_suffix, "t b a -> b t a")
 
         act_feats = None
@@ -169,53 +197,64 @@ class L2WorldModel(nn.Module):
             new_act = act_suffix[:, h: h + 1]
             act_feats = new_act if act_feats is None else torch.cat([act_feats, new_act], dim=1)
 
-            ctx_vid = vid_feats[:, -self.ctxt_window:]
+            ctx_abs = abs_feats[:, -self.ctxt_window:]                # (B_act, T_ctx, N_abs, D)
             ctx_prop = raw_prop[:, -self.ctxt_window:] if raw_prop is not None else None
             ctx_act = act_feats[:, -self.ctxt_window:]
+            T_ctx = ctx_abs.size(1)
 
-            pred_video, _, _ = self.predictor(
-                ctx_vid, ctx_act, ctx_prop,
-            )
+            pos_t = pos_ids.unsqueeze(1).expand(-1, T_ctx, -1)
+            sizes_t = sizes.unsqueeze(1).expand(-1, T_ctx, -1)
 
-            pred_video = rearrange(
-                pred_video, "b t (v h w) d -> b t v h w d",
-                h=self.grid_size, w=self.grid_size, v=1,
+            pred_abs, _, _ = self.predictor(
+                ctx_abs,
+                ctx_act,
+                ctx_prop,
+                external_pos_ids=pos_t,
+                external_sizes=sizes_t,
             )
 
             if self.normalize_reps:
-                pred_video = F.layer_norm(pred_video, (pred_video.size(-1),))
+                pred_abs = F.layer_norm(pred_abs, (pred_abs.size(-1),))
 
-            next_vid = pred_video[:, -1:]
-            vid_feats = torch.cat([vid_feats, next_vid], dim=1)
+            next_abs = pred_abs[:, -1:]                               # (B_act, 1, N_abs, D)
+            abs_feats = torch.cat([abs_feats, next_abs], dim=1)
 
-            # L2 does not predict proprio — repeat the last value forward
             if raw_prop is not None:
                 raw_prop = torch.cat([raw_prop, raw_prop[:, -1:]], dim=1)
             if out_prop is not None:
                 out_prop = torch.cat([out_prop, out_prop[:, -1:]], dim=1)
 
         if has_proprio:
-            vid_feats = rearrange(vid_feats, "b t ... -> t b ...")
+            visual_out = rearrange(abs_feats, "b t n d -> t b n d")
             prop_out = out_prop if out_prop.ndim >= 4 else out_prop.unsqueeze(2)
             prop_out = rearrange(prop_out, "b t ... -> t b ...")
-            return TensorDict({"visual": vid_feats, "proprio": prop_out})
+            return TensorDict({"visual": visual_out, "proprio": prop_out})
         else:
-            return rearrange(vid_feats, "b t ... -> t b ...")
+            return rearrange(abs_feats, "b t n d -> t b n d")
+
+    def encode(self, features, reference=None):
+        """Project (B, T, V, H, W, D) features into abstract space.
+
+        Used by the planner to wrap the goal and L1 unrolls into the same
+        partition that L2 just produced.
+        """
+        if reference is None:
+            reference = features[:, 0] if features.dim() == 6 else features
+        enc = encode_with_reference(
+            features if features.dim() == 6 else features.unsqueeze(1),
+            reference,
+            r=self.r,
+            metric_dim=self.bsm_metric_dim,
+        )
+        return enc
+
+    def apply_merge(self, features, merge_fn):
+        """Apply a precomputed merge_fn to a feature tensor."""
+        return apply_merge_to_features(features, merge_fn)
 
 
 def sample_waypoints(seq_len, num_waypoints, segment_range=(25, 70)):
-    """Sample random waypoint indices from a trajectory segment.
-
-    Args:
-        seq_len: total trajectory length
-        num_waypoints: N — number of waypoints to sample
-        segment_range: (min_len, max_len) — range for segment length
-
-    Returns:
-        waypoint_indices: sorted list of N indices
-        segment_start: start index of the segment
-        segment_end: end index of the segment
-    """
+    """Sample random waypoint indices from a trajectory segment."""
     min_len, max_len = segment_range
     max_len = min(max_len, seq_len)
     min_len = min(min_len, max_len)

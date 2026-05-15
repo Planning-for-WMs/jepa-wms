@@ -152,6 +152,83 @@ class ReprTargetDistMPCObjective(BaseMPCObjective):
         return diff
 
 
+class AbstractL1MPCObjective(BaseMPCObjective):
+    """L1 distance between L1-predicted features and an abstract-space target.
+
+    The L1 model produces 256-token features; the L2 abstract space holds
+    N_abs tokens after Bipartite Soft Matching. This objective wraps the L1
+    rollout with the same merge_fn that produced the abstract target before
+    measuring distance.
+
+    Args:
+        target_abs: (1, N_abs, D) or TensorDict with that visual + a passthrough
+            proprio target.
+        merge_fn: per-batch BSM callable that maps (B, V*H*W, D) → (B, N_abs, D).
+        sum_all_diffs: aggregate distances across the rollout.
+        alpha: weight for the proprio loss term.
+    """
+
+    def __init__(
+        self,
+        cfg: dict,
+        target_abs: Union[torch.Tensor, TensorDict],
+        merge_fn,
+        sum_all_diffs: bool = False,
+        alpha: float = 1.0,
+        **kwargs,
+    ):
+        self.cfg = cfg
+        self.target_abs = target_abs
+        self.merge_fn = merge_fn
+        self.sum_all_diffs = sum_all_diffs
+        self.alpha = alpha
+
+    def _merge_visual(self, visual: torch.Tensor) -> torch.Tensor:
+        """Apply merge_fn to a (T, B, V, H, W, D) L1 rollout.
+
+        Returns (T, B, N_abs, D).
+        """
+        T, B = visual.shape[:2]
+        V, H, W, D = visual.shape[2:]
+        flat = visual.reshape(T * B, V * H * W, D)
+        sizes = torch.ones(T * B, V * H * W, 1, device=visual.device, dtype=visual.dtype)
+        merged_sizes = self.merge_fn(sizes)
+        merged = self.merge_fn(flat * sizes) / merged_sizes.clamp(min=1.0)
+        return merged.reshape(T, B, merged.size(1), D)
+
+    def __call__(
+        self,
+        encodings: Union[torch.Tensor, TensorDict],
+        actions: torch.Tensor,
+        keepdims: bool = False,
+    ) -> torch.Tensor:
+        if isinstance(encodings, TensorDict) and isinstance(self.target_abs, TensorDict):
+            visual_abs = self._merge_visual(encodings["visual"])
+            tgt_v = self.target_abs["visual"]
+            diff_visual = torch.abs(tgt_v - visual_abs).mean(
+                dim=tuple(range(2, visual_abs.ndim))
+            )
+            diff_proprio = torch.abs(self.target_abs["proprio"] - encodings["proprio"]).mean(
+                dim=tuple(range(2, encodings["proprio"].ndim))
+            )
+            diff = diff_visual + self.alpha * diff_proprio
+        elif isinstance(encodings, torch.Tensor) and isinstance(self.target_abs, torch.Tensor):
+            visual_abs = self._merge_visual(encodings)
+            diff = torch.abs(self.target_abs - visual_abs).mean(
+                dim=tuple(range(2, visual_abs.ndim))
+            )
+        else:
+            raise ValueError("AbstractL1MPCObjective: input/target type mismatch")
+        if not keepdims:
+            if self.sum_all_diffs:
+                diff = diff.sum(0)
+            else:
+                diff = diff[-1]
+        elif self.sum_all_diffs:
+            diff = diff.cumsum(0).flip(0)
+        return diff
+
+
 class ReprTargetDistL1MPCObjective(BaseMPCObjective):
     """Objective to minimize L1 distance to the target representation."""
 

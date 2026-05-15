@@ -179,7 +179,20 @@ class FWAdaLNBlock(nn.Module):
 
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
 
-    def forward_attn(self, x, z, mask=None, attn_mask=None, T=None, H_patches=None, W_patches=None, cond_tokens=0, token_counts=None):
+    def forward_attn(
+        self,
+        x,
+        z,
+        mask=None,
+        attn_mask=None,
+        T=None,
+        H_patches=None,
+        W_patches=None,
+        cond_tokens=0,
+        token_counts=None,
+        n_visual_per_frame=None,
+        token_bias=None,
+    ):
         mod_raw = self.adaLN_modulation(z)
         if token_counts is not None:
             repeats = torch.tensor(token_counts, device=mod_raw.device)
@@ -187,6 +200,8 @@ class FWAdaLNBlock(nn.Module):
         else:
             N_per_ts = x.size(1) // T
             expanded = mod_raw.repeat_interleave(N_per_ts, dim=1)
+        if token_bias is not None:
+            expanded = expanded + token_bias
         shift_msa, scale_msa, gate_msa, _, _, _ = expanded.chunk(6, dim=2)
         if isinstance(self.attn, RoPEAttention):
             y = self.attn(
@@ -197,6 +212,7 @@ class FWAdaLNBlock(nn.Module):
                 H=H_patches,
                 W=W_patches,
                 action_tokens=cond_tokens,
+                n_visual_per_frame=n_visual_per_frame,
             )
         else:
             y = self.attn(
@@ -207,13 +223,15 @@ class FWAdaLNBlock(nn.Module):
         x = x + self.drop_path(y * gate_msa)
         return x, mod_raw
 
-    def forward_mlp(self, x, mod_raw, T, token_counts=None):
+    def forward_mlp(self, x, mod_raw, T, token_counts=None, token_bias=None):
         if token_counts is not None:
             repeats = torch.tensor(token_counts, device=mod_raw.device)
             expanded = torch.repeat_interleave(mod_raw, repeats, dim=1)
         else:
             N_per_ts = x.size(1) // T
             expanded = mod_raw.repeat_interleave(N_per_ts, dim=1)
+        if token_bias is not None:
+            expanded = expanded + token_bias
         _, _, _, shift_mlp, scale_mlp, gate_mlp = expanded.chunk(6, dim=2)
         x = x + self.drop_path(gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)))
         return x
@@ -276,11 +294,17 @@ class VisionTransformerAdaLN(nn.Module):
         action_encoder_inpred=True,
         tome_r=0,
         tome_mode="uniform",
+        external_merge=False,
+        external_n_abs=None,
         **kwargs,
     ):
         super().__init__()
         self.tome_r = tome_r
         self.tome_mode = tome_mode
+        # When external_merge=True, the predictor accepts already-merged
+        # abstract features and skips its internal token-merging path.
+        self.external_merge = external_merge
+        self.external_n_abs = external_n_abs
         self.attn_depth, self.attn_height, self.attn_width = local_window
         self.predictor_embed_dim = predictor_embed_dim
         self.proprio_encoder_inpred = proprio_encoder_inpred
@@ -359,6 +383,15 @@ class VisionTransformerAdaLN(nn.Module):
         self.predictor_norm = norm_layer(self.predictor_total_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
 
+        # Per-token size-mass conditioning for external-merge mode. The merged
+        # tokens carry a "size" scalar (1 for unmerged, 2 for a merged pair under
+        # r=N/2); routing log1p(size) into the AdaLN modulation lets the predictor
+        # know how much each token represents.
+        if self.external_merge:
+            self.size_to_mod = nn.Linear(1, 6 * self.predictor_total_embed_dim, bias=True)
+        else:
+            self.size_to_mod = None
+
         attn_mask = None
         self.cond_tokens = 0
         if self.attn_depth > 0 or self.attn_height > 0 or self.attn_width > 0:
@@ -367,12 +400,23 @@ class VisionTransformerAdaLN(nn.Module):
             grid_width = self.img_width // self.patch_size
             if self.proprio_tokens > 0 and self.proprio_encoding == "token":
                 self.cond_tokens += 1
-            attn_mask = build_action_block_causal_attention_mask(
-                grid_depth,
-                grid_height,
-                grid_width,
-                add_tokens=self.cond_tokens,
-            )
+            if self.external_merge and self.external_n_abs is not None:
+                # In external-merge mode the per-frame visual count is N_abs,
+                # not grid_h*grid_w. Build the temporal-block-causal mask with
+                # the correct per-frame width.
+                attn_mask = build_action_block_causal_attention_mask(
+                    grid_depth,
+                    self.external_n_abs,
+                    1,
+                    add_tokens=self.cond_tokens,
+                )
+            else:
+                attn_mask = build_action_block_causal_attention_mask(
+                    grid_depth,
+                    grid_height,
+                    grid_width,
+                    add_tokens=self.cond_tokens,
+                )
         self.attn_mask = attn_mask
 
         # ------ initialize weights
@@ -425,16 +469,21 @@ class VisionTransformerAdaLN(nn.Module):
         z = torch.cat([z_vis, proprio], dim=3)
         return z
 
-    def forward(self, x, actions, proprio=None):
+    def forward(self, x, actions, proprio=None, external_pos_ids=None, external_sizes=None):
         """
         Input:
-            x: B T V H W D
+            x: B T V H W D       (default mode)  or  B T N_abs D  (external_merge=True)
             actions: B T A
             proprio: B T P
+            external_pos_ids: B T N_abs  — original H*W flat indices of dst tokens
+            external_sizes:   B T N_abs  — per-token merge mass
         Returns:
-            x: B T H*W D
+            x: B T H*W D         (default mode)  or  B T N_abs D  (external_merge=True)
             proprio: B T 1 P (P=D if proprio_encoding='token' else P=proprio_dim)
         """
+        if self.external_merge:
+            return self._forward_external_merge(x, actions, proprio, external_pos_ids, external_sizes)
+
         # Map context tokens to pedictor dimensions
         x = self.predictor_embed(x)
         x = x.flatten(2, 4)  # [B, T, H*W, D]
@@ -617,6 +666,138 @@ class VisionTransformerAdaLN(nn.Module):
             elif self.proprio_encoding == "feature":
                 x = x.view(B, T, N_final, self.predictor_total_embed_dim)
                 x, proprio_features = x[:, :, :, : -self.proprio_emb_dim], x[:, :, :, -self.proprio_emb_dim :]
+        else:
+            x = x.view(B, T, N_final, self.predictor_total_embed_dim)
+            proprio_features = None
+
+        x = self.predictor_proj(x)
+        return x, None, proprio_features
+
+
+    def _forward_external_merge(self, x, actions, proprio, external_pos_ids, external_sizes):
+        """Forward pass when input has already been merged into abstract space.
+
+        x:                (B, T, N_abs, embed_dim)
+        external_pos_ids: (B, T, N_abs)  — values in [0, grid_h*grid_w)
+        external_sizes:   (B, T, N_abs)  — merge mass per token
+        """
+        B, T, N_abs, _ = x.shape
+
+        # Map to predictor dim
+        x = self.predictor_embed(x)              # (B, T, N_abs, D_pred)
+        D = x.size(-1)
+
+        if self.action_encoder_inpred:
+            z = self.action_encoder(actions)
+        else:
+            z = actions.squeeze(2)
+
+        proprio_emb = None
+        if self.use_proprio and proprio is not None:
+            if self.proprio_encoder_inpred:
+                proprio_emb = self.proprio_encoder(proprio).unsqueeze(2)  # (B, T, 1, D_pred or P_emb)
+            else:
+                proprio_emb = proprio.unsqueeze(2) if proprio.dim() == 3 else proprio
+            if self.proprio_encoding == "token":
+                x = torch.cat([proprio_emb, x], dim=2).flatten(1, 2)  # (B, T*(1+N_abs), D_pred)
+            elif self.proprio_encoding == "feature":
+                # Broadcast P_emb across the N_abs visual tokens
+                x = torch.cat([x, proprio_emb.expand(-1, -1, N_abs, -1)], dim=-1)
+                x = x.flatten(1, 2)  # (B, T*N_abs, D_pred + P_emb)
+        else:
+            x = x.flatten(1, 2)  # (B, T*N_abs, D_pred)
+
+        N_per_ts = self.cond_tokens + N_abs if (self.use_proprio and proprio is not None and self.proprio_encoding == "token") else N_abs
+
+        # Build temporal-block-causal attention mask for current T
+        if self.attn_depth > 0 or self.attn_height > 0 or self.attn_width > 0:
+            attn_mask = build_action_block_causal_attention_mask(
+                T, N_abs, 1, add_tokens=self.cond_tokens
+            ).to(x.device, non_blocking=True)
+        else:
+            attn_mask = None
+
+        # Build the per-token RoPE position mask. external_pos_ids holds
+        # original 16x16-flat indices in [0, grid_h*grid_w). To get a global
+        # position over T frames we offset by t * grid_h*grid_w.
+        rope_mask = None
+        if self.use_rope and external_pos_ids is not None:
+            grid_size_sq = self.grid_height * self.grid_width
+            t_idx = torch.arange(T, device=x.device).view(1, T, 1)
+            global_pos = external_pos_ids + t_idx * grid_size_sq  # (B, T, N_abs)
+            rope_mask = global_pos.reshape(B, T * N_abs)
+
+        # Per-token size-mass conditioning: a learned bias added to the AdaLN
+        # modulation expansion. Sizes are constant across the rollout under a
+        # fixed merge_fn, so this is just a per-token additive bias.
+        token_bias = None
+        if self.size_to_mod is not None and external_sizes is not None:
+            sizes_in = external_sizes.unsqueeze(-1).to(x.dtype).log1p()  # (B, T, N_abs, 1)
+            visual_bias = self.size_to_mod(sizes_in)                     # (B, T, N_abs, 6*D)
+            if self.use_proprio and proprio is not None and self.proprio_encoding == "token":
+                # prepend zeros for the proprio cond token(s)
+                cond_zeros = torch.zeros(
+                    B, T, self.cond_tokens, visual_bias.size(-1),
+                    device=x.device, dtype=visual_bias.dtype,
+                )
+                full_bias = torch.cat([cond_zeros, visual_bias], dim=2)
+            else:
+                full_bias = visual_bias
+            token_bias = full_bias.flatten(1, 2)  # (B, T*N_per_ts, 6*D_total)
+
+        # Forward through predictor blocks (no internal token merging)
+        for blk in self.predictor_blocks:
+            if self.use_activation_checkpointing:
+                x, mod_raw = torch.utils.checkpoint.checkpoint(
+                    blk.forward_attn,
+                    x,
+                    z,
+                    rope_mask,
+                    attn_mask,
+                    T,
+                    self.grid_height,
+                    self.grid_width,
+                    self.cond_tokens,
+                    None,
+                    N_abs,
+                    token_bias,
+                    use_reentrant=False,
+                )
+                x = torch.utils.checkpoint.checkpoint(
+                    blk.forward_mlp,
+                    x,
+                    mod_raw,
+                    T,
+                    None,
+                    token_bias,
+                    use_reentrant=False,
+                )
+            else:
+                x, mod_raw = blk.forward_attn(
+                    x,
+                    z,
+                    mask=rope_mask,
+                    attn_mask=attn_mask,
+                    T=T,
+                    H_patches=self.grid_height,
+                    W_patches=self.grid_width,
+                    cond_tokens=self.cond_tokens,
+                    token_counts=None,
+                    n_visual_per_frame=N_abs,
+                    token_bias=token_bias,
+                )
+                x = blk.forward_mlp(x, mod_raw, T, token_counts=None, token_bias=token_bias)
+
+        x = self.predictor_norm(x)
+
+        N_final = x.size(1) // T  # cond_tokens + N_abs (token mode) or N_abs (feature mode)
+        if self.use_proprio and proprio is not None:
+            if self.proprio_encoding == "token":
+                x = x.view(B, T, N_final, D)
+                x, proprio_features = x[:, :, self.cond_tokens:, :], x[:, :, : self.cond_tokens, :]
+            elif self.proprio_encoding == "feature":
+                x = x.view(B, T, N_final, self.predictor_total_embed_dim)
+                x, proprio_features = x[:, :, :, : -self.proprio_emb_dim], x[:, :, :, -self.proprio_emb_dim:]
         else:
             x = x.view(B, T, N_final, self.predictor_total_embed_dim)
             proprio_features = None
