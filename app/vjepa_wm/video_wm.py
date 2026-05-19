@@ -111,8 +111,8 @@ class VideoWM(nn.Module):
         # Rollout behavior
         self.proprio_rollout_mode = proprio_rollout_mode
         # Validation
-        if self.enc_type == "dino":
-            assert self.batchify_video == True, "batchify_video must be True for dino"
+        if self.enc_type in ("dino", "flextok"):
+            assert self.batchify_video == True, "batchify_video must be True for dino/flextok"
         # Device
         self.device = device
         # Optimization parameters
@@ -171,7 +171,7 @@ class VideoWM(nn.Module):
                 visual = visual.repeat_interleave(2, dim=1)  # b, (2 t), c, h, w
             else:
                 visual = visual.unsqueeze(2).repeat(1, 1, 2, 1, 1)  # b c 2 h w
-        if self.enc_type == "dino":  # no duplication needed
+        if self.enc_type in ("dino", "flextok"):  # both are per-frame encoders (batchified)
             visual_embs = self.encoder(visual)
             visual_embs = rearrange(
                 visual_embs, "(b t) (h w) d -> b t 1 h w d", b=b, h=self.grid_size, w=self.grid_size
@@ -187,7 +187,7 @@ class VideoWM(nn.Module):
             else:
                 visual_embs = rearrange(visual_embs, "b (t h w) d -> b t 1 h w d", h=self.grid_size, w=self.grid_size)
         else:
-            raise ValueError("enc_type must be 'dino' or 'vjepa' ")
+            raise ValueError("enc_type must be 'dino', 'flextok', or 'vjepa'")
         if self.normalize_reps:
             visual_embs = F.layer_norm(visual_embs, (visual_embs.size(-1),))
         if self.use_proprio and proprio is not None:

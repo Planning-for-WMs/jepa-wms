@@ -573,6 +573,7 @@ def init_video_model(
     use_sdpa_enc=True,
     uniform_power=True,
     num_frames_enc=16,
+    eval_keep_k=256,
     # Predictor architecture
     pred_type="dino_wm",
     pred_depth=6,
@@ -689,6 +690,17 @@ def init_video_model(
         ).to(device)
         for p in encoder.parameters():
             p.requires_grad = False
+        encoder = encoder.eval()
+    elif enc_type == "flextok":
+        from app.plan_common.models.flextok_enc import FlexTokEncoder
+
+        encoder = FlexTokEncoder(
+            model_id=enc_version,
+            img_size=img_size,
+            eval_keep_k=eval_keep_k,
+        ).to(device)
+        # FlexTokEncoder already freezes all internal parameters in __init__;
+        # proj (if any) remains trainable and is handled by the optimizer separately.
         encoder = encoder.eval()
     logger.info(f"Encoder: {encoder}")
     assert (

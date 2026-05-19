@@ -397,7 +397,7 @@ class EncPredWM(nn.Module):
             # self.tubelet_size_enc==1 for self.enc_type == "dino"
             if self.enc_type == "vjepa":
                 trans_visual = trans_visual.repeat(1, self.tubelet_size_enc, 1, 1, 1)  # b 1 c h w -> b t c h w
-        if self.enc_type == "dino":
+        if self.enc_type in ("dino", "flextok"):
             visual_embs = self.model.encoder(trans_visual)
             visual_embs = rearrange(
                 visual_embs, "(b t) (h w) d -> b t 1 h w d", b=b, h=self.grid_size, w=self.grid_size
